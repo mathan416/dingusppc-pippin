@@ -7,6 +7,7 @@
 # Change log:
 #   2026-11-16 - Added: ARM64 build and CTest run for the pippin branch.
 #   2026-11-16 - JIT self-tests via --jit-selftest with a zero-filled dummy ROM (no firmware needed).
+#   2026-11-16 - actions/checkout v5 (Node 24).
 # Full history: PIPPIN.md and Git history.
 name: Pippin ARM64
 
@@ -20,7 +21,7 @@ jobs:
   arm64:
     runs-on: ubuntu-24.04-arm
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
       with:
         submodules: recursive
 

@@ -97,17 +97,30 @@ image):
 sudo apt install libsdl2-2.0-0 libasound2 libpulse0 libsamplerate0
 ```
 
-Unpack the one for your Pi and start a game:
+The steps are the same on both boards; only the file name changes. Set `PI` to `pi4` or
+`pi5`, then download, unpack and start a game:
 
 ```
-tar xf dingusppc-pippin-v1.0.0-pi4.tar.gz
-cd dingusppc-pippin-v1.0.0-pi4
+PI=pi4    # or pi5
+wget https://github.com/mathan416/dingusppc-pippin/releases/download/v1.0.0/dingusppc-pippin-v1.0.0-$PI.tar.gz
+tar xf dingusppc-pippin-v1.0.0-$PI.tar.gz
+cd dingusppc-pippin-v1.0.0-$PI
 ./run.sh /path/to/kinka13.rom /path/to/disc.bin
 ```
 
-The Pi 4 build also runs on a Pi 5, a little slower than the Pi 5 build. No ROM or game
-discs are included: you need your own. On a Pi 5, read [Raspberry Pi 5](#raspberry-pi-5)
-first.
+Add `PIPPIN_AUTHENTIC=on` in front of `./run.sh` to run at a real Pippin's CPU speed.
+No ROM or game discs are included: you need your own, and the disc image must be
+writable. The Pi 4 build also runs on a Pi 5, a little slower than the Pi 5 build.
+
+**Pi 5 only:** before the first run, switch to the 4 KB-page kernel so the fast memory
+path is used (one-time; see [Raspberry Pi 5](#raspberry-pi-5)):
+
+```
+echo 'kernel=kernel8.img' | sudo tee -a /boot/firmware/config.txt
+sudo reboot
+```
+
+After the reboot, `getconf PAGESIZE` should print `4096`.
 
 ## Building
 

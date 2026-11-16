@@ -19,6 +19,16 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-16 - Q234: optional authentic-speed mode (CPU governor, CD-ROM timing model).
+ *   2026-11-16 - Review fixes: a new command or SCSI RST cancels a CD hold; DataIn timing passes the target ID.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 /** @file MESH (Macintosh Enhanced SCSI Hardware) controller emulation. */
 
 #include <core/timermanager.h>
@@ -156,6 +166,10 @@ void MeshController::write(uint8_t reg_offset, uint8_t value) {
 }
 
 void MeshController::perform_command(const uint8_t cmd) {
+    // Q234: a new sequencer command supersedes a pending CD hold.
+    if (this->cd_hold) [[unlikely]]
+        this->cd_cancel_hold();
+
     this->cur_cmd = cmd;
 
     this->int_stat &= ~INT_CMD_DONE;
@@ -202,7 +216,7 @@ void MeshController::perform_command(const uint8_t cmd) {
         this->to_xfer = this->xfer_count ? this->xfer_count : 65536;
         this->cur_state = Scsi_Bus_Controller::SeqState::XFER_BEGIN;
         if (pippin_cd_model_on) [[unlikely]] {   // Q234: drive transfer/seek time in guest time
-            const uint64_t wait_ns = pippin_cd_datain_wait_ns(this->to_xfer,
+            const uint64_t wait_ns = pippin_cd_datain_wait_ns(this->dst_id, this->to_xfer,
                 TimerManager::get_instance()->current_time_ns());
             if (wait_ns) {
                 this->cd_hold_datain(wait_ns);
@@ -286,6 +300,10 @@ void MeshController::update_bus_status(const uint16_t new_stat) {
             }
         }
     }
+
+    // Q234: asserting SCSI RST abandons any held CD transfer.
+    if ((new_stat & SCSI_CTRL_RST) && !(this->bus_stat & SCSI_CTRL_RST))
+        this->cd_cancel_hold();
 
     // update the upper part (BusStatus1)
     if ((new_stat ^ this->bus_stat) & 0xFF00U) {

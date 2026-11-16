@@ -19,6 +19,15 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): report trigger-only AppleJack changes.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 /** @file Apple Desktop Bus AppleJack controller emulation. */
 
 #include <devices/common/adb/adbapplejack.h>

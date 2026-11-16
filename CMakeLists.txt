@@ -1,3 +1,10 @@
+# DingusPPC-Pippin modifications
+# Copyright (c) 2026 Iain Bennett
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Change log:
+#   2026-11-16 - DPPC_BUILD_PIPPIN_TESTS registers the Pippin unit tests with CTest.
+# Full history: PIPPIN.md and Git history.
+
 cmake_minimum_required(VERSION 3.14)
 project(dingusppc)
 
@@ -50,6 +57,7 @@ if (EMSCRIPTEN)
 endif()
 
 option(DPPC_BUILD_PPC_TESTS  "Build PowerPC tests" OFF)
+option(DPPC_BUILD_PIPPIN_TESTS "Build and register the Pippin unit tests with CTest" OFF)
 option(DPPC_BUILD_BENCHMARKS "Build benchmarking programs" OFF)
 
 option(DPPC_68K_DEBUGGER   "Enable 68k debugging" OFF)
@@ -295,6 +303,20 @@ if (DPPC_BUILD_PPC_TESTS)
         "${PROJECT_SOURCE_DIR}/cpu/ppc/test/ppcfloattests.csv"
         "${PROJECT_SOURCE_DIR}/cpu/ppc/test/ppcdisasmtest.csv"
         "$<TARGET_FILE_DIR:$<TARGET_PROPERTY:NAME>>")
+endif()
+
+# DingusPPC-Pippin unit tests (audio buffering, pacing, AppleJack buttons). Run with ctest.
+if (DPPC_BUILD_PIPPIN_TESTS)
+    enable_testing()
+    foreach(PIPPIN_TEST boundaries fragments-pointer timing-state)
+        add_executable(pippin-test-${PIPPIN_TEST} pippin/support/test-${PIPPIN_TEST}.cpp)
+        target_include_directories(pippin-test-${PIPPIN_TEST} PRIVATE
+            ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/pippin/support)
+        target_link_libraries(pippin-test-${PIPPIN_TEST} PRIVATE SDL2::SDL2)
+        # The tests use assert(); keep it active in Release builds.
+        target_compile_options(pippin-test-${PIPPIN_TEST} PRIVATE -UNDEBUG)
+        add_test(NAME pippin-${PIPPIN_TEST} COMMAND pippin-test-${PIPPIN_TEST})
+    endforeach()
 endif()
 
 install (TARGETS dingusppc DESTINATION ${PROJECT_SOURCE_DIR}/build)

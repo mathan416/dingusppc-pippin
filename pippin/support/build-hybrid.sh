@@ -1,4 +1,13 @@
 #!/bin/bash
+# Project: DingusPPC-Pippin
+# File: pippin/support/build-hybrid.sh
+# Purpose: Build and run the support unit tests.
+# Author: Iain Bennett
+# Copyright (c) 2026 Iain Bennett
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Change log:
+#   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+# Full history: PIPPIN.md and Git history.
 set -euo pipefail
 nice -n 15 g++ -std=c++17 -O2 -Wall -Wextra -I/work/dingusppc $(sdl2-config --cflags) /work/test-boundaries.cpp -o /session/test-boundaries
 /session/test-boundaries | tee /session/boundaries.log

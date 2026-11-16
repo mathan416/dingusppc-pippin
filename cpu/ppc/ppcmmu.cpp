@@ -19,6 +19,16 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): split MMU fast paths, fastmem publication, ROM window.
+ *   2026-11-15 - Q227: precise tlbie (congruence class) and ROM window kept across same-mode MMU changes.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 /** @file PowerPC Memory Management Unit emulation. */
 
 #include <core/memaccess.h>

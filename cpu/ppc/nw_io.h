@@ -19,6 +19,16 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Adapted from billcavalieri/macemu (branch arm64-jit, commit 1e6abc0) for the
+ * DingusPPC Pippin machine model. This file stays GPL-2.0-or-later, as above.
+ * Change log:
+ *   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): connected to DingusPPC through sheep_jit_bridge, fastmem and ROM dispatch.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 #ifndef NW_IO_H
 #define NW_IO_H
 

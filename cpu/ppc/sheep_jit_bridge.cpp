@@ -1,4 +1,14 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/sheep_jit_bridge.cpp
+// Purpose: Bridge between the SheepShaver-derived ARM64 JIT and the DingusPPC CPU, MMU and devices.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+//   2026-11-16 - Fastmem self-tests are skipped on hosts without 4 KB pages (e.g. a Pi 5 16 KB kernel).
+//   2026-11-16 - Verify mode runs the authentic-speed CD model self-test.
+// Full history: PIPPIN.md and Git history.
 // Experimental Pippin backend: SheepShaver ARM64 emitter + DingusPPC devices.
 // Translates qualified arithmetic, branch and guarded RAM operations.
 // Device I/O, MMU misses, privileged operations, interrupts and timers retain
@@ -8,6 +18,7 @@
 #include "sheep_jit_bridge.h"
 #include "nw_jit.h"
 #include "pippin_fastmem.h"
+#include "pippin_authentic.h"
 #include <array>
 #include <cstddef>
 #include <core/memaccess.h>
@@ -672,6 +683,8 @@ static void prepare_rom_dispatch(){
 extern void sheep_mmu_test_fast_page(uint8_t*,uint8_t*,uint32_t,uint16_t,bool,unsigned);
 extern void sheep_mmu_test_fast_transition(unsigned);
 static void hardware_fastmem_selftest(){
+ if(!pippin_authentic_selftest())throw std::runtime_error("Authentic-speed CD model selftest failed");
+ if(!pippin_fastmem_host_supported()){fprintf(stderr,"PIPPIN FASTMEM selftests skipped (host page size is not 4 KB)\n");return;}
  if(!pippin_fastmem_enabled())throw std::runtime_error("Requested hardware fastmem is unavailable");
  const auto saved=ppc_state;const auto flags=exec_flags,next=ppc_next_instruction_address;
  auto *read=pippin_fastmem_alloc(4096),*write=pippin_fastmem_alloc(4096);if(!read||!write)throw std::runtime_error("Fastmem shared fixture allocation failed");
@@ -741,6 +754,7 @@ static void hardware_fastmem_selftest(){
 }
 
 static void guard_forwarding_selftest(){
+ if(!pippin_fastmem_host_supported())return;
  const auto saved=ppc_state;const auto flags=exec_flags,next=ppc_next_instruction_address;
  auto *read=pippin_fastmem_alloc(4096),*write=pippin_fastmem_alloc(4096);if(!read||!write)throw std::runtime_error("Guard forwarding allocation failed");
  unsigned passed=0;

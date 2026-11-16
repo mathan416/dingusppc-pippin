@@ -1,4 +1,13 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/clock-publication-tests.inc
+// Purpose: Verify-mode tests for guest clock publication across JIT exits.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+//   2026-11-16 - Fastmem self-tests are skipped on hosts without 4 KB pages (e.g. a Pi 5 16 KB kernel).
+// Full history: PIPPIN.md and Git history.
 // Exact Q201361 reference; only global-clock stores differ in the candidate.
 #include <signal.h>
 #if defined(__aarch64__)
@@ -680,8 +689,10 @@ int sheep_clock_publication_selftest(){
   };
   for(unsigned kind=0;kind<6;kind++)for(unsigned variant=0;variant<8;variant++)trial(0,kind,variant);
   for(unsigned identities=0;identities<4;identities++)for(unsigned variant=0;variant<4;variant++)trial(1,identities,variant);
-  for(unsigned first_second=0;first_second<2;first_second++)for(unsigned prefix=0;prefix<2;prefix++)trial(2,first_second,prefix);
-  need(passed==68&&observers==48&&private_cases==16&&fault_cases==4,"fixed focused clock-publication census");
+  // Group 2 uses a real 4 KB hardware alias; hosts without 4 KB pages run without fastmem.
+  const bool page_frames=pippin_fastmem_host_supported();
+  if(page_frames)for(unsigned first_second=0;first_second<2;first_second++)for(unsigned prefix=0;prefix<2;prefix++)trial(2,first_second,prefix);
+  need(passed==(page_frames?68u:64u)&&observers==48&&private_cases==16&&fault_cases==(page_frames?4u:0u),"fixed focused clock-publication census");
  }catch(...){cleanup();throw;}
  cleanup();fprintf(stderr,"CLOCK PUBLICATION SELFTEST %u native_observers=%u private_foreign=%u genuine_faults=%u frozen361/fullCPU/context/RAM/flags/NIA/finalclock/ABI cases passed\n",passed,observers,private_cases,fault_cases);return 1;
 #else

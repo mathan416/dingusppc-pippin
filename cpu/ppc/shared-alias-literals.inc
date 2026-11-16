@@ -1,4 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/shared-alias-literals.inc
+// Purpose: Verify-mode tests for literals shared between memory aliases.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 // PRIVATE VERIFY FIXTURE: include in nw_jit.cpp immediately before its final
 // #else (the !__aarch64__ stubs). Declare/call the function from the bridge's
 // verify setup, then reset_native_and_rom() before other fixtures or gameplay.

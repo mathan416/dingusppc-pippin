@@ -1,4 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/scalar-branch-tests.inc
+// Purpose: Verify-mode tests for scalar branch translation.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 // Exact scalar B/BC transitions versus the frozen original dispatcher and
 // independent canonical per-instruction replay. No native-admission changes.
 #if defined(__aarch64__)

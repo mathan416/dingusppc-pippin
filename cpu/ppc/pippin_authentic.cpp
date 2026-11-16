@@ -1,3 +1,13 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/pippin_authentic.cpp
+// Purpose: Optional authentic-speed mode: CPU governor and CD-ROM timing model.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-16 - Q234: optional authentic-speed mode (CPU governor, CD-ROM timing model).
+//   2026-11-16 - Review fixes: CD timing scoped to the reading target, reset on guest restart, requires --realtime; self-test.
+// Full history: PIPPIN.md and Git history.
 // Q234: optional authentic-speed mode for the Pippin hybrid (off by default).
 //
 // CPU governor: coarse token bucket checked once per process_events() batch. Guest time stays
@@ -51,6 +61,7 @@ struct Gov {
 struct Cd {
     double   bytes_per_ns = 0, seek_ns = 0, seek_min_ns = 0, readahead_bytes = 0, blk_ns = 0, buf_blocks = 0;
     bool     trace = false, active = false, have_prev = false;
+    int      target = -1;   // SCSI ID of the drive whose READ is being timed
     double   seg_lba = 0, seg_t0 = 0, last_req_end = 0, cap_lba = 0;   // segment state (blocks)
     double   cmd_start_ns = 0, prev_end_ns = 0;
     uint64_t issued = 0;
@@ -59,6 +70,9 @@ struct Cd {
 } cd;
 
 bool logged = false;
+
+// Per-machine drive state; the parsed settings in cd are kept.
+void cd_runtime_reset() { cd.active = false; cd.have_prev = false; cd.target = -1; cd.issued = 0; }
 
 constexpr uint64_t GOV_SLACK_NS = 150'000;     // sleep only when >= 0.15 ms ahead
 constexpr uint64_t GOV_BURST_NS = 4'000'000;   // at most 4 ms of lost time may be caught up
@@ -101,7 +115,9 @@ void stats_at_exit() {
 } // namespace
 
 void pippin_authentic_init() {
-    if (logged) return;
+    // Settings are parsed once per process; a guest restart rebuilds the machine and resets guest
+    // time, so drop the previous machine's drive position and stream.
+    if (logged) { cd_runtime_reset(); return; }
     logged = true;
     bool ok = true;
     const char* a = std::getenv("SHEEP_PIPPIN_AUTHENTIC");
@@ -157,7 +173,10 @@ void pippin_authentic_init() {
         gov.ns_per_insn = 1000.0 / mips;
         gov.insn_per_ns = mips / 1000.0;
     }
-    pippin_cd_model_on = kibps > 0;
+    // Like the governor, the CD model is defined against realtime guest time.
+    if (kibps > 0 && !g_realtime)
+        fprintf(stderr, "PIPPIN-AUTHENTIC CD model needs --realtime; CD timing disabled\n");
+    pippin_cd_model_on = kibps > 0 && g_realtime;
     const bool trace = cd.trace;
     cd = Cd{};
     cd.trace = trace;
@@ -223,8 +242,9 @@ static double cd_access_ns(double dist_blocks) {
     return cd.seek_min_ns + (cd.seek_ns - cd.seek_min_ns) * frac;
 }
 
-void pippin_cd_on_command(const uint8_t* cdb, uint64_t now_ns) {
+void pippin_cd_on_command(int target, const uint8_t* cdb, uint64_t now_ns) {
     cd.active = false;
+    cd.target = target;
     uint64_t lba, nblocks;
     switch (cdb[0]) {
     case 0x08: // READ(6)
@@ -283,8 +303,8 @@ void pippin_cd_on_command(const uint8_t* cdb, uint64_t now_ns) {
                 (unsigned long long)lba, (unsigned long long)nblocks, unsigned(sequential), (cd.cmd_start_ns - now) / 1e6);
 }
 
-uint64_t pippin_cd_datain_wait_ns(int bytes, uint64_t now_ns) {
-    if (!cd.active || bytes <= 0) return 0;
+uint64_t pippin_cd_datain_wait_ns(int target, int bytes, uint64_t now_ns) {
+    if (!cd.active || bytes <= 0 || target != cd.target) return 0;
     cd.datain++;
     cd.issued += uint64_t(bytes);
     cd.bytes += uint64_t(bytes);
@@ -295,4 +315,29 @@ uint64_t pippin_cd_datain_wait_ns(int bytes, uint64_t now_ns) {
     cd.held++;
     cd.wait_ns += wait;
     return uint64_t(wait);
+}
+
+// Verify-mode check of the CD model's scoping and restart handling (runs on a private copy of the state).
+bool pippin_authentic_selftest() {
+    const Cd saved = cd;
+    bool ok = true;
+    auto check = [&](bool good, const char* why) { if (!good && ok) { ok = false; fprintf(stderr, "PIPPIN-AUTHENTIC selftest failed: %s\n", why); } };
+    cd = Cd{};
+    cd.bytes_per_ns = 600 * 1024.0 / 1e9; cd.seek_ns = 180e6; cd.seek_min_ns = 50e6;
+    cd.readahead_bytes = 256 * 1024.0; cd.blk_ns = 2048.0 / cd.bytes_per_ns; cd.buf_blocks = cd.readahead_bytes / 2048.0;
+    const uint8_t read10[10] = {0x28, 0, 0, 0, 0x10, 0, 0, 0, 16, 0};
+    const uint64_t t = 5'000'000'000ull;
+    pippin_cd_on_command(3, read10, t);
+    check(pippin_cd_datain_wait_ns(0, 2048, t) == 0, "DataIn from another target is not delayed");
+    check(pippin_cd_datain_wait_ns(3, 2048, t) > 0, "DataIn from the reading drive pays the seek");
+    const uint8_t inquiry[6] = {0x12, 0, 0, 0, 36, 0};
+    pippin_cd_on_command(3, inquiry, t);
+    check(pippin_cd_datain_wait_ns(3, 36, t) == 0, "a non-READ command ends the timed stream");
+    pippin_cd_on_command(3, read10, t);
+    cd_runtime_reset();   // guest restart
+    check(pippin_cd_datain_wait_ns(3, 2048, 1'000'000) == 0, "restart drops the previous machine's stream");
+    check(!cd.have_prev, "restart forgets the old head position");
+    cd = saved;
+    fprintf(stderr, "PIPPIN-AUTHENTIC selftest result=%s\n", ok ? "pass" : "FAIL");
+    return ok;
 }

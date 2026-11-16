@@ -1,4 +1,13 @@
 #!/bin/bash
+# Project: DingusPPC-Pippin
+# File: pippin/pi4-build/build-pi4-chroot.sh
+# Purpose: Console script behind the deployed Pi 4 builds.
+# Author: Iain Bennett
+# Copyright (c) 2026 Iain Bennett
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Change log:
+#   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+# Full history: PIPPIN.md and Git history.
 # Q233: Q227 + Taos 59.94 Hz VBL; Q224a (Q219 source, cortex-a72 + LTO) plus cached exec-entry environment lookups.
 set -euo pipefail
 p=/home/pi/sheepshaver-pippin-port-20261110

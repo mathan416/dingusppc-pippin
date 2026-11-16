@@ -1,4 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/tag-dispatch.inc
+// Purpose: Tagged dispatch table for translated blocks.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 // Private actual-ASM tag routing oracle. Include after loop_fixture_event().
 // Export/call int sheep_tag_dispatch_selftest() from the private bridge verify
 // setup, then reset native/ROM dispatch before other fixtures or gameplay.

@@ -1,3 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: devices/video/frame_pixel_pool.h
+// Purpose: Reusable frame pixel buffers for presentation.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 // Private Pippin pilot: three reusable pixel buffers, no SDL or guest state.
 #ifndef PIPPIN_FRAME_PIXEL_POOL_H
 #define PIPPIN_FRAME_PIXEL_POOL_H

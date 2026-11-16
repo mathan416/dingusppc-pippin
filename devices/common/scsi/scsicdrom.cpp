@@ -19,6 +19,16 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-16 - Q234: optional authentic-speed mode (CPU governor, CD-ROM timing model).
+ *   2026-11-16 - Review fix: CD timing sees only validated CDBs, tagged with this drive's ID.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 /** @file SCSI CD-ROM emulation. */
 
 #include <core/timermanager.h>
@@ -54,14 +64,14 @@ ScsiCdrom::ScsiCdrom(std::string name, int my_id) : ScsiPhysDevice(name, my_id)
 void ScsiCdrom::process_command() {
     uint32_t lba;
 
-    // Q234: CD timing model sees every CDB (READs start a timed stream).
-    if (pippin_cd_model_on) [[unlikely]]
-        pippin_cd_on_command(this->cmd_buf, TimerManager::get_instance()->current_time_ns());
-
     if (this->verify_cdb() < 0) {
         this->switch_phase(ScsiPhase::STATUS);
         return;
     }
+
+    // Q234: CD timing model sees every valid CDB (READs start a timed stream).
+    if (pippin_cd_model_on) [[unlikely]]
+        pippin_cd_on_command(this->scsi_id, this->cmd_buf, TimerManager::get_instance()->current_time_ns());
 
     // assume successful command execution
     phy_impl->set_status(ScsiStatus::GOOD);

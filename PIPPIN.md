@@ -33,6 +33,10 @@ two submodules are identical to upstream's pinned commits.
 | Q227 | Precise `tlbie` (congruence class), ROM window kept across same-mode `mmu_change_mode` | L-Zone +7.8%, Tamagotchi +2.2%; fastmem remaps −80% |
 | Q233 | Taos VBL at 59.94 Hz (half-line timing decode, 17.075 MHz Athens crystal) | Refresh 35.2 → 59.94 Hz; about −3% CPU |
 | Q234 | Optional authentic-speed mode (off by default): CPU governor and CD-ROM timing model | Default unchanged (+0.7%, noise); L-Zone intro at 95% of a real Pippin with the preset |
+| Review fixes | From an external code review: MESH DMA returns bytes delivered and keeps FIFO order; held CD transfers cancelled on DMA stop/pause, new commands and SCSI reset; CD timing scoped to the reading drive, reset on guest restart, needs `--realtime`; monotonic guest clock; governor batches never exceed the ungoverned size; controller hotplug; bounded window resize and per-axis DPI; README run command fixed | Pi 4 and Pi 500 speed unchanged (within noise) |
+| F12 | ROM window kept across exceptions and `rfi` unless a deferred mapping change or endian switch is pending | ROM-window invalidations −50%; Pi 4 +0.5% (noise) |
+| Pi 5 | `pippin/build.sh` tunes for Pi 4 or Pi 5; fastmem switches itself off on 16 KB-page kernels | Pi 500 (4 KB kernel): L-Zone about 137 M instr/s, 3.6× the Pi 4 |
+| CI | `--jit-selftest`, CTest registration of the unit tests, ARM64 GitHub Actions job | — |
 
 On the L-Zone intro, the CPU-bound fly-in runs at about 146% of a real
 Pippin. Timer- and audio-paced content runs at true speed under
@@ -40,7 +44,8 @@ Pippin. Timer- and audio-paced content runs at true speed under
 
 ## Building and running
 
-See `pippin/pi4-build/README.md`. Typical cabinet invocation:
+Build with `pippin/build.sh` (see the README); `pippin/pi4-build/` has the exact script
+behind the deployed Pi 4 builds. Typical cabinet invocation:
 
     pippin-v233 -r --realtime --start-date=1997-06-01 -m pippin -b kinka13.rom \
       --cdr_config=ScsiMesh:3 --cdr_img2=disc.bin --rambank3_size=8 \
@@ -48,8 +53,13 @@ See `pippin/pi4-build/README.md`. Typical cabinet invocation:
 
 Runtime policy environment, as deployed: `SHEEP_PIPPIN_JIT=on
 SHEEP_PIPPIN_FASTMEM=on SHEEP_PIPPIN_ROM_ONLY=1 SHEEP_CPU_OWNER=on
-SHEEP_RAW_FRAME=on SHEEP_PIPPIN_ROM_WINDOW=on SHEEP_PIPPIN_ISLAND_PACK=on`.
+SHEEP_RAW_FRAME=on SHEEP_FRAME_POOL=off SHEEP_PIPPIN_ROM_WINDOW=on
+SHEEP_PIPPIN_ISLAND_PACK=on mesa_glthread=false`. Raw frames need
+`SHEEP_FRAME_POOL=off`; with the pool on (its default under `SHEEP_CPU_OWNER=on`)
+frames are converted to RGB on the guest thread instead.
 `SHEEP_PIPPIN_JIT=verify` runs the startup self-tests and the interpreter oracle.
+`--jit-selftest` runs only the self-tests and exits (0 = pass); it needs no real ROM, so CI
+runs it with a zero-filled 4 MB file.
 
 ## Authentic-speed mode (Q234)
 
@@ -63,17 +73,30 @@ Off by default; acts only under `--realtime`. Guest timers, video and audio are 
 | `SHEEP_PIPPIN_CD_SEEK_MS`, `SHEEP_PIPPIN_CD_SEEK_MIN_MS`, `SHEEP_PIPPIN_CD_READAHEAD_KB` | CD access-time model and drive buffer |
 
 The cabinet's `pippin-authentic-speed` launcher entry uses `SHEEP_PIPPIN_AUTHENTIC=on
-SHEEP_PIPPIN_CD_SPEED=off` (CPU cap only): with the CD model on, the known L-Zone intro
-stall occurred in 2 of 17 runs.
+SHEEP_PIPPIN_CD_SPEED=off` (CPU cap only). With the CD model on, the L-Zone intro stall
+(see Known issues) happens in roughly 1 run in 8, so the CD model stays off by default.
 
 ## Candidates for upstream DingusPPC
 
 - Taos timing: decode half-lines, VBL per field, Athens crystal.
 - Precise `tlbie` instead of a full PAT flush.
 - Reading environment settings once at exec entry.
+- MESH `xfer_from` returning the bytes it delivered (DBDMA expects that; upstream returns 0).
+- Bounded window resizing and per-axis floating-point DPI scale.
+- Opening game controllers connected after start-up.
 
 ## Known issues
 
-- The L-Zone intro occasionally (~2%) stays black after a CD access at
-  about 37 s. It also occurs on the Q219 baseline; the cause is not yet known.
+- The L-Zone intro occasionally stays black and silent (about 2% historically; 0 of 64
+  recent default-mode runs on Pi 4 and Pi 500). It also occurs on the Q219 baseline.
+  Traced on 2026-11-16: every CD, SCSI/MESH, DMA, sound and VIA event matches a normal
+  run up to the stall; the game's 68K code then spins on an asynchronous File Manager
+  read whose `ioResult` never leaves "busy", and its Time Manager task stops re-arming.
+  It is far more frequent with the CD timing model on (about 1 in 8). Making the MESH
+  transfer-count register track programmed-I/O bytes made it more frequent, so the
+  game's CD driver reads that register and the cause is likely in how the emulated
+  controller reports transfers. Workaround: exit and relaunch.
+- *Compton's Interactive Encyclopedia @World Edition* (USA beta, 1996-10-31) stops at its
+  title screen and ignores input. It configures serial port B (the modem port) just
+  before, so it most likely waits for a modem or online service, which is not emulated.
 - The Taos dot clock for VGA output is unverified (NTSC is correct).

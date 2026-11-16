@@ -1,8 +1,18 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/fastmem-offset.inc
+// Purpose: Verify-mode tests for register-offset fastmem loads and stores.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+//   2026-11-16 - Fastmem self-tests are skipped on hosts without 4 KB pages (e.g. a Pi 5 16 KB kernel).
+// Full history: PIPPIN.md and Git history.
 // Include in sheep_jit_bridge.cpp after hardware_fastmem_selftest(), before
 // sheep_jit_enabled(). Call fastmem_offset_selftest() during verify setup.
 // Inherited hardware_fastmem_selftest() already covers the traced payloads.
 static void fastmem_offset_selftest(){
+ if(!pippin_fastmem_host_supported())return;
  if(!pippin_fastmem_enabled())throw std::runtime_error("Register-offset fixture requires hardware fastmem");
  const auto saved_layout=native_layout;
  const auto saved_cpu=ppc_state;

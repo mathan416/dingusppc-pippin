@@ -19,6 +19,16 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): CPU-owner thread, realtime clock, Pippin cabinet options.
+ *   2026-11-16 - --jit-selftest option for CI (JIT self-tests without running guest code).
+ * Full history: PIPPIN.md and Git history.
+ */
+
 // The main runfile - main.cpp
 // This is where the magic begins
 
@@ -35,6 +45,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <utils/profiler.h>
 #include <main.h>
 #include <main_cpu_owner.h>
+#include <cpu/ppc/sheep_jit_bridge.h>
 #include <atomic>
 #include <algorithm>
 #include <cstdio>
@@ -367,6 +378,9 @@ public:
 
 const WorkingDirectoryValidator WorkingDirectory;
 
+// --jit-selftest: run the JIT verify-mode self-tests after machine setup, then exit.
+static bool g_jit_selftest = false;
+
 void run_machine(
     std::string machine_str, char *rom_data, size_t rom_size, uint32_t execution_mode
     ,const std::vector<std::string> &env_vars
@@ -410,6 +424,8 @@ int main(int argc, char** argv) {
         ->check(WorkingDirectory)->capture_default_str();
     auto bootrom_opt = emu->add_option("-b,--bootrom", bootrom_path, "Specifies BootROM path")
         ->check(CLI::ExistingFile)->capture_default_str();
+    emu->add_flag("--jit-selftest", g_jit_selftest,
+        "Run the ARM64 JIT verify-mode self-tests after machine setup and exit (0 = pass); no guest code runs");
     emu->add_flag("--realtime", g_realtime,
         "Advance guest timers using the host clock");
     auto deterministic_opt = emu->add_flag("--deterministic", is_deterministic,
@@ -680,8 +696,26 @@ void run_machine(std::string machine_str, char* rom_data,
      profiling_interval_ms
 #endif
 ) {
+    if (g_jit_selftest) {
+        // Self-tests use their own code fixtures; the boot ROM only has to let the machine be built.
+        setenv("SHEEP_PIPPIN_JIT", "verify", 1);
+        setenv("SHEEP_PIPPIN_FASTMEM", "on", 0);
+    }
+
     if (MachineFactory::create_machine_for_id(machine_str, rom_data, rom_size) < 0) {
         return;
+    }
+
+    if (g_jit_selftest) {
+        bool ok = false;
+        try {
+            ok = sheep_jit_enabled();
+        } catch (const std::exception& e) {
+            fprintf(stderr, "PIPPIN JIT SELFTEST error: %s\n", e.what());
+        }
+        fprintf(stderr, "PIPPIN JIT SELFTEST %s\n", ok ? "PASS" : "FAIL");
+        fflush(stderr);
+        std::_Exit(ok ? 0 : 1);
     }
 
     if (!env_vars.empty()) {

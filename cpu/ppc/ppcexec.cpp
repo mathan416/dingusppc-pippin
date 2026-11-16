@@ -19,6 +19,19 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): JIT dispatch, CPU-owner thread, realtime guest clock.
+ *   2026-11-15 - Q226: read exec-entry environment settings once.
+ *   2026-11-16 - Q234: optional authentic-speed mode (CPU governor, CD-ROM timing model).
+ *   2026-11-16 - Review fixes: monotonic guest clock (steady_clock); governor batches never exceed the ungoverned size.
+ *   2026-11-16 - F12: endian change invalidates the ROM window only when the mode changes.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 #include <core/timermanager.h>
 #include <loguru.hpp>
 #include "ppcemu.h"
@@ -303,7 +316,14 @@ void ppc_msr_did_change(uint32_t old_msr_val, uint32_t new_msr_val, bool set_nex
 }
 
 void ppc_change_endian(bool newLE) {
-    sheep_mmu_rom_window_invalidate();
+    // F12: exceptions call this with the current mode; only a real change invalidates the ROM window.
+#if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
+    if (ppc_state.is_LE != newLE)
+        sheep_mmu_rom_window_invalidate();
+#else
+    if (newLE)   // big-endian only: the mode never changes, and LE is rejected below
+        sheep_mmu_rom_window_invalidate();
+#endif
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
     if (ppc_state.is_LE != newLE) {
         LOG_F(INFO, "changed endian to %s", newLE ? "LE" : "BE");
@@ -413,8 +433,11 @@ static long long cpu_now_ns() {
 #ifdef __APPLE__
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 #else
+    // Guest time must be monotonic: libstdc++'s high_resolution_clock is the wall clock,
+    // which NTP can step (a Pi has no RTC and steps its clock once the network syncs).
+    static_assert(std::chrono::steady_clock::is_steady, "guest clock must be monotonic");
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 #endif
 }
 
@@ -467,8 +490,9 @@ static uint64_t process_events()
         const uint64_t slice_ns = std::min(delay_ns, TIMER_POLL_INTERVAL_NS);
         // Q234: a governed CPU retires fewer instructions per guest ns; size the batch so the
         // next timer deadline is reached on time instead of 62.5/max_mips times late.
+        // A cap above the ungoverned rate must not enlarge the batch: timer callbacks would wait longer.
         if (pippin_gov_enabled) [[unlikely]]
-            return g_icycles + pippin_gov_insns_for_ns(slice_ns) + 1;
+            return g_icycles + std::min<uint64_t>(pippin_gov_insns_for_ns(slice_ns), slice_ns >> icnt_factor) + 1;
         return g_icycles + (slice_ns >> icnt_factor) + 1;
     }
     return (

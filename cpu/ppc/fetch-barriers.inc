@@ -1,4 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/fetch-barriers.inc
+// Purpose: Instruction-fetch barrier handling for the JIT dispatcher.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 // Included after ppc_exec_inner. The exact shared C++ dispatcher is exercised
 // with a compile-only deadline/path selector; production instantiations use0.
 // No live TimerManager queue is inspected, drained, rescheduled or replaced.

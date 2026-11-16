@@ -1,4 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/generic-continuation-tests.inc
+// Purpose: Verify-mode tests for generic JIT continuations.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 // Q193 kind0 differential against exact verified Q185/Q175 generic288.
 // Actual1/2/3/4 returns use planned4; actual32 uses planned32. No new admission,
 // wrapper prefix, resident-state ABI, type3 or deferred CPU state is introduced.

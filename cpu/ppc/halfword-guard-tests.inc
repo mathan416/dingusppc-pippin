@@ -1,7 +1,17 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/halfword-guard-tests.inc
+// Purpose: Verify-mode tests for halfword loads and stores near guard pages.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+//   2026-11-16 - Fastmem self-tests are skipped on hosts without 4 KB pages (e.g. a Pi 5 16 KB kernel).
+// Full history: PIPPIN.md and Git history.
 // Actual aliases and unchanged canonical PPC interpreter. No widened access.
 static void sheep_halfword_guard_selftest(){
 #if defined(__aarch64__)
+ if(!pippin_fastmem_host_supported())return;
  SetPRS saved;std::memcpy(&saved,&ppc_state,sizeof(saved));
  const auto flags0=exec_flags,nia0=ppc_next_instruction_address;const auto clock0=g_icycles;
  const bool bail0=memory_bail,timer0=exec_timer,power0=power_on;

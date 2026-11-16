@@ -19,6 +19,15 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): host event capture on the main thread for the CPU-owner thread.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 #ifndef EVENT_MANAGER_H
 #define EVENT_MANAGER_H
 

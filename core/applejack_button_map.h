@@ -1,4 +1,13 @@
-// GPL-3.0-or-later. SDL buttons without AppleJack equivalents are ignored.
+// Project: DingusPPC-Pippin
+// File: core/applejack_button_map.h
+// Purpose: Map SDL game-controller buttons to AppleJack buttons.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
+// SDL buttons without AppleJack equivalents are ignored.
 #pragma once
 #include <SDL.h>
 #include <core/hostevents.h>

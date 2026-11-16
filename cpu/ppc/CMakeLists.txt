@@ -1,3 +1,10 @@
+# DingusPPC-Pippin modifications
+# Copyright (c) 2026 Iain Bennett
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Change log:
+#   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): build the ARM64 JIT and fastmem sources.
+# Full history: PIPPIN.md and Git history.
+
 include_directories("${PROJECT_SOURCE_DIR}"
                     "${PROJECT_SOURCE_DIR}/thirdparty/loguru/")
 

@@ -19,6 +19,16 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): raw indexed frame presentation from the CPU-owner thread.
+ *   2026-11-16 - Review fixes: warn when raw frames are requested with the frame pool on; bounded window resize loop; fractional per-axis DPI scale.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 #include <devices/video/display.h>
 #include <devices/video/videoctrl.h>
 #include <devices/video/taos.h>
@@ -143,6 +153,8 @@ Display::Display(): impl(std::make_unique<Impl>()) {
     if (pool_option && std::strcmp(pool_option, "on") && std::strcmp(pool_option, "off"))
         throw std::invalid_argument("SHEEP_FRAME_POOL must be on or off");
     impl->pool_enabled = pippin_cpu_owner::enabled() && (!pool_option || !std::strcmp(pool_option, "on"));
+    if (impl->raw_enabled && impl->pool_enabled)
+        LOG_F(WARNING, "SHEEP_RAW_FRAME=on has no effect while the frame pool is on; set SHEEP_FRAME_POOL=off");
     impl->mailbox->owner = this;
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
 }
@@ -297,7 +309,8 @@ void Display::update_window_size() {
 
     int w, h;
     double w_err, h_err;
-    while (1) {
+    // Bounded: a backend that refuses or clamps the requested size must not hang the SDL owner.
+    for (int attempt = 0;; ++attempt) {
         impl->drawable_w = this->scale_window * impl->display_w;
         impl->drawable_h = this->scale_window * impl->display_h;
 
@@ -315,6 +328,12 @@ void Display::update_window_size() {
 
         if (w_err < 4 && h_err < 4)
             break;
+        if (attempt >= 15) {
+            LOG_F(WARNING, "update_window_size: window size not honoured after %d attempts; keeping %d x %d", attempt + 1, w, h);
+            impl->drawable_w = w;
+            impl->drawable_h = h;
+            break;
+        }
 
         this->scale_window /= scale_step;
     }
@@ -454,8 +473,10 @@ unsigned Display::handle_events_main(const WindowEvent& wnd_event) {
             SDL_GetWindowSize(impl->display_wnd, &ww, &wh);
             int w, h;
             SDL_GetRendererOutputSize(impl->renderer, &w, &h);
-            double new_default_scale_x = w / ww;
-            double new_default_scale_y = w / ww;
+            if (ww <= 0 || wh <= 0)
+                break;
+            double new_default_scale_x = double(w) / ww;
+            double new_default_scale_y = double(h) / wh;
             if (new_default_scale_x != impl->default_scale_x || new_default_scale_y != impl->default_scale_y) {
                 // recalculate scale when switching between Retina and Low Resolution modes
                 impl->drawable_w = impl->drawable_w * new_default_scale_x / impl->default_scale_x;

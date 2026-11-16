@@ -89,8 +89,8 @@ issues.
 ## Building
 
 The JIT emits ARM64 code, so build on 64-bit ARM Linux. We build and test on a Raspberry
-Pi 4 running 64-bit Raspberry Pi OS. You need a C++20 compiler (we use GCC 13), CMake and
-the SDL2 development headers.
+Pi 4 running 64-bit Raspberry Pi OS (see below for the Pi 5). You need a C++20 compiler
+(we use GCC 13), CMake and the SDL2 development headers.
 
 ```
 git clone --recursive -b pippin https://github.com/mathan416/dingusppc-pippin
@@ -98,26 +98,21 @@ cd dingusppc-pippin
 sudo apt install cmake libsdl2-dev
 ```
 
-Pi 4 release build:
+Then build:
 
 ```
-FLAGS="-mcpu=cortex-a72 -flto=2 -flto-partition=one -fno-fat-lto-objects"
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS" \
-      -DCMAKE_EXE_LINKER_FLAGS="$FLAGS -Wl,-u,pippin_cpu_owner_guest_time_ns" \
-      -DCMAKE_AR=$(which gcc-ar) -DCMAKE_RANLIB=$(which gcc-ranlib) ..
-cmake --build . --parallel 2
+pippin/build.sh
 ```
 
-The binary is `build/bin/dingusppc`.
+The script picks the right CPU tuning for a Pi 4 (`cortex-a72`) or Pi 5 (`cortex-a76`)
+and puts the binary in `build/bin/dingusppc`. If you build by hand, keep its two rules:
 
 - Keep LTO to a single partition. The CPU loop's inline assembly uses symbol offsets that
   break if LTO splits it up.
 - Don't use PGO. It moves globals that the CPU loop expects at fixed offsets. The startup
   self-tests catch this.
 
-See `pippin/pi4-build/` for the exact script behind our deployed builds.
+`pippin/pi4-build/` has the exact script behind our deployed Pi 4 builds.
 
 ## Running
 
@@ -126,7 +121,8 @@ as a raw image.
 
 ```
 SHEEP_PIPPIN_JIT=on SHEEP_PIPPIN_FASTMEM=on SHEEP_PIPPIN_ROM_ONLY=1 \
-SHEEP_CPU_OWNER=on SHEEP_RAW_FRAME=on SHEEP_PIPPIN_ROM_WINDOW=on SHEEP_PIPPIN_ISLAND_PACK=on \
+SHEEP_CPU_OWNER=on SHEEP_RAW_FRAME=on SHEEP_FRAME_POOL=off \
+SHEEP_PIPPIN_ROM_WINDOW=on SHEEP_PIPPIN_ISLAND_PACK=on mesa_glthread=false \
 ./dingusppc -r --realtime --start-date=1997-06-01 -m pippin -b kinka13.rom \
   --cdr_config=ScsiMesh:3 --cdr_img2=disc.bin --rambank3_size=8 \
   --adb_devices=AppleJack,Keyboard
@@ -157,6 +153,27 @@ real AppleJack. A gamepad maps to the AppleJack like this:
 | D-pad | Directional pad |
 | LB / RB | Left / right trigger (these also act as mouse clicks) |
 | Back / Guide / Start | The three front buttons |
+
+## Raspberry Pi 5
+
+The Pi 5 runs the same code. On a Pi 500 (same chip as the Pi 5) the L-Zone intro runs
+at about 3.6 times the Pi 4's speed, so every game has plenty of headroom.
+
+- **Use the 4 KB-page kernel.** Raspberry Pi OS boots the Pi 5 with 16 KB memory pages,
+  and fastmem only works with 4 KB pages. With 16 KB pages it switches itself off and
+  the emulator still runs, just slower. Add this to `/boot/firmware/config.txt` and
+  reboot:
+
+  ```
+  kernel=kernel8.img
+  ```
+
+  `getconf PAGESIZE` should then print `4096`.
+- **Build with `pippin/build.sh`**, which tunes for the Pi 5's Cortex-A76.
+- **Audio:** the Pi 5 has no headphone jack, so sound goes to HDMI or a USB audio device.
+  If you have no sound, check which ALSA device SDL is using.
+- **Display:** under KMS/DRM the Pi 5 numbers its display devices differently from the
+  Pi 4. If SDL picks the wrong one, set `SDL_KMSDRM_DEVICE_INDEX`.
 
 ## About DingusPPC
 

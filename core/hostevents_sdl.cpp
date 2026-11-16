@@ -19,6 +19,16 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): SDL gamepad to AppleJack mapping, pointer buttons, main-thread capture.
+ *   2026-11-16 - Review fix: open game controllers connected after start-up; close removed ones.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 #include <main_cpu_owner.h>
 #include <stdexcept>
 #include <vector>
@@ -103,7 +113,18 @@ void EventManager::capture_host_events() {
             pippin_cpu_owner::post_guest([] { power_off(po_quit); });
             break;
 
+        case SDL_CONTROLLERDEVICEADDED:
+            // cdevice.which is a device index here (an instance ID in every other controller event).
+            if (SDL_IsGameController(event.cdevice.which))
+                SDL_GameControllerOpen(event.cdevice.which);
+            break;
+
         case SDL_CONTROLLERDEVICEREMOVED:
+            if (SDL_GameController *gc = SDL_GameControllerFromInstanceID(event.cdevice.which))
+                SDL_GameControllerClose(gc);
+            applejack_buttons.release(event.cdevice.which,emit_button);
+            break;
+
         case SDL_JOYDEVICEREMOVED:
             applejack_buttons.release(event.jdevice.which,emit_button);
             break;

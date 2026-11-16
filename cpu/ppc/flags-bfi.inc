@@ -1,4 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/flags-bfi.inc
+// Purpose: Condition-flag helpers for JIT code generation.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 // Include in ppcexec.cpp after loop_fixture_event(), then call once at the
 // beginning of sheep_cpu_loop_selftest(). This is the Q129 mapped-leaf oracle.
 static void sheep_flags_bfi_selftest(){

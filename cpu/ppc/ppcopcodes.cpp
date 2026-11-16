@@ -19,6 +19,17 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): JIT-aware opcode handlers and MMU invalidation hooks.
+ *   2026-11-15 - Q227: precise tlbie (congruence class) and ROM window kept across same-mode MMU changes.
+ *   2026-11-16 - F12: context sync invalidates the ROM window only when deferred actions are pending.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 // General opcodes for the processor - ppcopcodes.cpp
 
 #include <core/bitops.h>
@@ -67,7 +78,10 @@ std::vector<CtxSyncCallback> gCtxSyncCallbacks;
 
 // perform context synchronization by executing registered actions if any
 void do_ctx_sync() {
-    sheep_mmu_rom_window_invalidate();
+    // F12: only pending deferred actions change translations here. add_ctx_sync_action already
+    // invalidated the ROM window; invalidate again in case it was re-armed before this sync.
+    if (!gCtxSyncCallbacks.empty())
+        sheep_mmu_rom_window_invalidate();
     while (!gCtxSyncCallbacks.empty()) {
         gCtxSyncCallbacks.back()();
         gCtxSyncCallbacks.pop_back();

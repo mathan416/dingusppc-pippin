@@ -1,3 +1,13 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/rom-window-tests.inc
+// Purpose: Verify-mode tests for the ROM window and MMU mode changes.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+//   2026-11-15 - Q227: precise tlbie (congruence class) and ROM window kept across same-mode MMU changes.
+// Full history: PIPPIN.md and Git history.
 // Q203 startup-only canonical MMU custody. No TimerManager or device I/O.
 // All instruction tables are copied because the loop oracle may touch any page
 // of this real ROM BAT. Original queue/tracked vectors are moved out, not run.

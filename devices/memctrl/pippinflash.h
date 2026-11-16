@@ -1,3 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: devices/memctrl/pippinflash.h
+// Purpose: Pippin Am29F010 save flash.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 /* Pippin Am29F010 save flash. GPL-3.0-or-later, matching DingusPPC.
  * Command sequences follow AMD Am29F010; Pippin's data bus reverses D0..D7
  * and connects flash A0 to CPU A2 (one byte on each 32-bit word's high lane).

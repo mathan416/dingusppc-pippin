@@ -1,4 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: pippin/support/pilot-reference-timer.cpp
+// Purpose: Reference timer used by benchmarks.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 // Private benchmark instrumentation for a SHA-256-pinned, unchanged reference.
 #include <link.h>
 #include <cstdint>

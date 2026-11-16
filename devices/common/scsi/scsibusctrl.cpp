@@ -19,6 +19,16 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-16 - Q234: optional authentic-speed mode (CPU governor, CD-ROM timing model).
+ *   2026-11-16 - Review fixes: xfer_from returns bytes delivered and keeps FIFO order; held CD transfers skip stopped or paused DMA channels.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 /** @file SCSI bus controller emulation. */
 
 #include <core/timermanager.h>
@@ -54,9 +64,16 @@ void ScsiBusController::cd_hold_datain(uint64_t delay_ns) {
             this->sequencer();
             if (DmaChannel* ch = this->cd_held_dma) {
                 this->cd_held_dma = nullptr;
-                ch->xfer_retry();   // DBDMA pull that arrived during the hold
+                if (ch->dma_is_ready())   // never write into a stopped or paused channel's buffer
+                    ch->xfer_retry();     // DBDMA pull that arrived during the hold
             }
     });
+}
+
+void ScsiBusController::notify(DmaChannel* ch_obj, DmaMsg msg) {
+    // Q234: a stopped or paused channel drops its claim on the held CD transfer.
+    if (msg == DMA_MSG_STOP && ch_obj == this->cd_held_dma)
+        this->cd_held_dma = nullptr;
 }
 
 void ScsiBusController::cd_cancel_hold() {
@@ -265,15 +282,21 @@ int ScsiBusController::xfer_from(DmaChannel *ch_obj, uint8_t *buf, int len) {
     if (len > this->to_xfer + this->fifo_pos)
         LOG_F(WARNING, "%s: DMA xfer len > command xfer len", this->name.c_str());
 
+    // DBDMA treats the return value as bytes delivered into buf (see DMAChannel::xfer_from_device).
+    int fifo_bytes = 0;
     if (this->fifo_pos) {
-        int fifo_bytes = std::min(this->fifo_pos, len);
+        fifo_bytes = std::min(this->fifo_pos, len);
         std::memcpy(buf, this->data_fifo, fifo_bytes);
         this->fifo_pos -= fifo_bytes;
+        if (this->fifo_pos > 0)   // keep any unread FIFO bytes in order
+            std::memmove(this->data_fifo, &this->data_fifo[fifo_bytes], this->fifo_pos);
         len -= fifo_bytes;
         buf += fifo_bytes;
     }
 
     int dma_bytes = std::min(this->to_xfer, len);
+    if (dma_bytes <= 0)
+        return fifo_bytes;
 
     if (this->bus_obj->pull_data(this->dst_id, buf, dma_bytes)) {
         this->to_xfer -= dma_bytes;
@@ -282,10 +305,10 @@ int ScsiBusController::xfer_from(DmaChannel *ch_obj, uint8_t *buf, int len) {
             this->cur_state = SeqState::XFER_END;
             this->sequencer();
         }
-        return 0;
+        return fifo_bytes + dma_bytes;
     }
 
-    return len;
+    return fifo_bytes;   // the target delivered nothing more
 }
 
 void ScsiBusController::update_irq() {

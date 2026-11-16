@@ -1,4 +1,13 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/decode-bound.inc
+// Purpose: Verify-mode tests for JIT decode bounds at the end of ROM and guarded pages.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+//   2026-11-16 - Guarded-page test uses the host page size (works on 16 KB-page kernels).
+// Full history: PIPPIN.md and Git history.
 // Private Q161 bridge fixture: actual planner/emitter + canonical interpreter.
 #include <devices/memctrl/memctrlbase.h>
 #include <sys/mman.h>
@@ -104,22 +113,23 @@ int sheep_decode_bound_selftest(){
   // Real PROT_NONE after the final source page proves no fifth-word read or
   // negative-cache sentinel copy beyond ROMremaining. RAM uses execution4.
   for(unsigned kind=0;kind<3;kind++){
-   auto*pages=static_cast<uint8_t*>(mmap(nullptr,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));require(pages!=MAP_FAILED,"guarded source mmap");
-   const unsigned words=kind==0?3:4;auto*source=pages+4096-words*4;for(unsigned i=0;i<words;i++)write_be(source+i*4,4,0x38630001u);
-   require(!mprotect(pages+4096,4096,PROT_NONE),"protected next source page");
+   const size_t host_page=size_t(sysconf(_SC_PAGESIZE));
+   auto*pages=static_cast<uint8_t*>(mmap(nullptr,2*host_page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));require(pages!=MAP_FAILED,"guarded source mmap");
+   const unsigned words=kind==0?3:4;auto*source=pages+host_page-words*4;for(unsigned i=0;i<words;i++)write_be(source+i*4,4,0x38630001u);
+   require(!mprotect(pages+host_page,host_page,PROT_NONE),"protected next source page");
    const uint32_t pc=0x10000040u;const auto slot=sheep_jit_filter_slot_rom(source),hot=sheep_hot_index(source,pc);const auto old_word=sheep_rom_dispatch_words[slot];const auto old_counter=sheep_jit_reject_filter[slot];const auto old_slot=sheep_hot_slots[hot];
    bool mapped_cleanup=false;
    try{
     sheep_rom_only=true;sheep_rom_host_begin=reinterpret_cast<uintptr_t>(code.data());sheep_rom_host_end=sheep_rom_host_begin+code.size();sheep_rom_direct_reset();
-    sheep_rom_host_begin=reinterpret_cast<uintptr_t>(pages);sheep_rom_host_end=sheep_rom_host_begin+4096;map_code(source,pc,kind!=2);sheep_rom_only=kind!=2;mode=2;native_layout.trace_host=native_layout.trace_old=native_layout.trace_size=0;
+    sheep_rom_host_begin=reinterpret_cast<uintptr_t>(pages);sheep_rom_host_end=sheep_rom_host_begin+host_page;map_code(source,pc,kind!=2);sheep_rom_only=kind!=2;mode=2;native_layout.trace_host=native_layout.trace_old=native_layout.trace_size=0;
     uint32_t description;require(sheep_encode_rom_handler(0x38630001u,description),"guarded source description");sheep_rom_dispatch_words[slot]=(uint64_t(0x38630001u)<<32)|description;sheep_jit_reject_filter[slot]=0;sheep_hot_slots[hot]=SheepHotSlot{};cache[cache_slot(source,pc)]=Entry{};
     if(kind==2){general_index=sheep_jit_filter_slot_general(source,pc);general_old=sheep_jit_reject_filter[general_index];general_touched=true;sheep_jit_reject_filter[general_index]=0;}
     const auto initial=cpu_seed(pc,0);
     for(unsigned warm=0;warm<4;warm++){reset(initial);require(!sheep_jit_try(source,4,32)&&untouched(initial),"guarded source warm bound");}
     reset(initial);const unsigned actual=sheep_jit_try(source,4,32);require(kind==0?(!actual&&untouched(initial)&&!cache[cache_slot(source,pc)].host):(actual==4&&ppc_state.gpr[3]==initial.gpr[3]+4&&cache[cache_slot(source,pc)].n==4),"protected source decode/read/execute bounds");
     sheep_rom_only=true;sheep_rom_direct_reset();restore_general();sheep_rom_dispatch_words[slot]=old_word;sheep_jit_reject_filter[slot]=old_counter;sheep_hot_slots[hot]=old_slot;cache[cache_slot(source,pc)]=Entry{};mapped_cleanup=true;
-   }catch(...){if(!mapped_cleanup){sheep_rom_only=true;sheep_rom_direct_reset();restore_general();sheep_rom_dispatch_words[slot]=old_word;sheep_jit_reject_filter[slot]=old_counter;sheep_hot_slots[hot]=old_slot;cache[cache_slot(source,pc)]=Entry{};}munmap(pages,8192);throw;}
-   require(!munmap(pages,8192),"guarded source munmap");protected_cases++;passed++;
+   }catch(...){if(!mapped_cleanup){sheep_rom_only=true;sheep_rom_direct_reset();restore_general();sheep_rom_dispatch_words[slot]=old_word;sheep_jit_reject_filter[slot]=old_counter;sheep_hot_slots[hot]=old_slot;cache[cache_slot(source,pc)]=Entry{};}munmap(pages,2*host_page);throw;}
+   require(!munmap(pages,2*host_page),"guarded source munmap");protected_cases++;passed++;
   }
   require(passed==67&&positive==40&&legacy==8&&bounds==16&&protected_cases==3,"fixed case census");okay=true;
  }catch(const std::exception&e){fprintf(stderr,"DECODE BOUND fixture exception: %s\n",e.what());}

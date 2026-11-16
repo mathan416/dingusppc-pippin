@@ -1,4 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/raw-literals.inc
+// Purpose: Raw literal pools for JIT code.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 // Included after nw_jit.cpp's backend #endif. Same fixture in fixed and
 // regression-only builds. Root bridge resets ROM descriptors before/after it.
 #if defined(__aarch64__)

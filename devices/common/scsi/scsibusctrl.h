@@ -19,6 +19,16 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+ * DingusPPC-Pippin modifications
+ * Copyright (c) 2026 Iain Bennett
+ * Licensed under the same terms as above.
+ * Change log:
+ *   2026-11-16 - Q234: optional authentic-speed mode (CPU governor, CD-ROM timing model).
+ *   2026-11-16 - Review fix: DMA stop/pause notification for held CD transfers.
+ * Full history: PIPPIN.md and Git history.
+ */
+
 /** @file SCSI bus controller definitions. */
 
 #ifndef SCSI_BUS_CTRL_H
@@ -76,6 +86,7 @@ public:
 
     // ScsiPhysDevice methods
     void notify(ScsiNotification notif_type, int param) override;
+    void notify(DmaChannel* ch_obj, DmaMsg msg) override;
     bool has_data() override { return false; }
     bool rcv_data();
     int  send_data(uint8_t* dst_ptr, int count) override;

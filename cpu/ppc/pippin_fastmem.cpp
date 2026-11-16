@@ -1,4 +1,13 @@
+// Project: DingusPPC-Pippin
+// File: cpu/ppc/pippin_fastmem.cpp
+// Purpose: Fastmem: guest RAM aliased into host memory for JIT loads and stores.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+//   2026-11-16 - Hosts without 4 KB pages fall back to the software path, with a log line; pippin_fastmem_host_supported().
+// Full history: PIPPIN.md and Git history.
 // Process-private ARM64 fastmem. Missing/protected pages resume the unchanged
 // software guards; only registered JIT payload PCs can use fault recovery.
 #include "pippin_fastmem.h"
@@ -60,7 +69,10 @@ struct Manager {
   return -1;
  }
  Manager(){
-  const char *setting=std::getenv("SHEEP_PIPPIN_FASTMEM");if(!setting||std::strcmp(setting,"on")||sysconf(_SC_PAGESIZE)!=long(page))return;
+  const char *setting=std::getenv("SHEEP_PIPPIN_FASTMEM");if(!setting||std::strcmp(setting,"on"))return;
+  // Fastmem maps 4 KB guest pages one-to-one onto host pages. Other host page sizes (e.g. a Pi 5's
+  // default 16 KB kernel) fall back to the software memory path; the emulator stays correct.
+  if(!pippin_fastmem_host_supported()){fprintf(stderr,"PIPPIN FASTMEM off: host page size %ld (needs 4096; on a Pi 5 boot kernel8.img)\n",sysconf(_SC_PAGESIZE));return;}
   void *result=mmap(nullptr,space*modes*2,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
   if(result==MAP_FAILED){fprintf(stderr,"PIPPIN FASTMEM unavailable: arena errno=%d\n",errno);return;}
   arena=static_cast<uint8_t*>(result);usable=true;
@@ -98,6 +110,7 @@ static void fault_handler(int signal,siginfo_t *info,void *context){
 }
 }
 uintptr_t pippin_fastmem_read=0,pippin_fastmem_write=0;
+bool pippin_fastmem_host_supported(){return sysconf(_SC_PAGESIZE)==long(page);}
 bool pippin_fastmem_enabled(){return manager().usable;}
 uint8_t *pippin_fastmem_alloc(size_t size){
  auto &m=manager();if(!m.usable||!size||(size&(page-1)))return nullptr;
@@ -174,7 +187,7 @@ void pippin_fastmem_poll(){
 unsigned pippin_fastmem_fault_count(){auto&m=manager();return unsigned(m.faults);}
 #else
 uintptr_t pippin_fastmem_read=0,pippin_fastmem_write=0;
-bool pippin_fastmem_enabled(){return false;}uint8_t*pippin_fastmem_alloc(size_t){return nullptr;}bool pippin_fastmem_release(uint8_t*){return false;}
+bool pippin_fastmem_host_supported(){return false;}bool pippin_fastmem_enabled(){return false;}uint8_t*pippin_fastmem_alloc(size_t){return nullptr;}bool pippin_fastmem_release(uint8_t*){return false;}
 void pippin_fastmem_select(unsigned){}void pippin_fastmem_revoke(unsigned,uint32_t){}void pippin_fastmem_publish(unsigned,unsigned,uint32_t,uint16_t,uintptr_t,uintptr_t){}
 void pippin_fastmem_refresher(PippinFastmemRefresh){}void pippin_fastmem_mmu(uintptr_t,uintptr_t){}void pippin_fastmem_poll(){}void pippin_fastmem_code(void*,size_t){}void pippin_fastmem_clear(unsigned){}bool pippin_fastmem_faults(const PippinFastmemFault*,size_t n){return n==0;}unsigned pippin_fastmem_fault_count(){return 0;}
 #endif

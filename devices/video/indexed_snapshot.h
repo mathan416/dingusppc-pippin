@@ -1,4 +1,12 @@
+// Project: DingusPPC-Pippin
+// File: devices/video/indexed_snapshot.h
+// Purpose: Owned indexed-colour Taos frame snapshot.
+// Author: Iain Bennett
+// Copyright (c) 2026 Iain Bennett
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Change log:
+//   2026-11-15 - Q219 baseline: added for the Pippin port (work from Q48 to Q219, before version control).
+// Full history: PIPPIN.md and Git history.
 // Owned Taos pixels. No SDL, guest callbacks, or guest pointers survive capture.
 #ifndef PIPPIN_INDEXED_SNAPSHOT_H
 #define PIPPIN_INDEXED_SNAPSHOT_H

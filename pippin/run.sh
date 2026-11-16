@@ -19,6 +19,7 @@ set -eu
 rom=$1; disc=$2; shift 2
 [ -f "$rom" ] || { echo "ROM not found: $rom" >&2; exit 1; }
 [ -f "$disc" ] || { echo "Disc image not found: $disc" >&2; exit 1; }
+[ -w "$disc" ] || { echo "Disc image is read-only: $disc (DingusPPC opens it read/write; run chmod u+w on it)" >&2; exit 1; }
 
 here=$(cd "$(dirname "$0")" && pwd)
 bin=${DINGUSPPC:-}

@@ -86,6 +86,29 @@ and discs.
 See [PIPPIN.md](PIPPIN.md) for provenance, change history, build instructions and known
 issues.
 
+## Downloading a release
+
+Prebuilt binaries are on the [Releases](https://github.com/mathan416/dingusppc-pippin/releases)
+page: one tuned for the Pi 4 and one for the Pi 5. Both need **64-bit Raspberry Pi OS
+Bookworm** or newer, plus these libraries (most are already installed on the desktop
+image):
+
+```
+sudo apt install libsdl2-2.0-0 libasound2 libpulse0 libsamplerate0
+```
+
+Unpack the one for your Pi and start a game:
+
+```
+tar xf dingusppc-pippin-v1.0.0-pi4.tar.gz
+cd dingusppc-pippin-v1.0.0-pi4
+./run.sh /path/to/kinka13.rom /path/to/disc.bin
+```
+
+The Pi 4 build also runs on a Pi 5, a little slower than the Pi 5 build. No ROM or game
+discs are included: you need your own. On a Pi 5, read [Raspberry Pi 5](#raspberry-pi-5)
+first.
+
 ## Building
 
 The JIT emits ARM64 code, so build on 64-bit ARM Linux. We build and test on a Raspberry
@@ -176,7 +199,8 @@ at about 3.6 times the Pi 4's speed, so every game has plenty of headroom.
   ```
 
   `getconf PAGESIZE` should then print `4096`.
-- **Build with `pippin/build.sh`**, which tunes for the Pi 5's Cortex-A76.
+- **Use the Pi 5 release build, or build with `pippin/build.sh`**, which tunes for the
+  Pi 5's Cortex-A76.
 - **Audio:** the Pi 5 has no headphone jack, so sound goes to HDMI or a USB audio device.
   If you have no sound, check which ALSA device SDL is using.
 - **Display:** under KMS/DRM the Pi 5 numbers its display devices differently from the

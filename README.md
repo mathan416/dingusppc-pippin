@@ -62,8 +62,6 @@ real-hardware footage. See [PIPPIN.md](PIPPIN.md#authentic-speed-mode-q234).
 - Timer- and audio-paced content runs at true speed, matched against a recording of
   real hardware.
 
-A Pi 4 is enough; a Pi 5 is not required.
-
 ## SheepShaver lineage
 
 The JIT comes from the SheepShaver ARM64 work by **Bill Cavalieri**

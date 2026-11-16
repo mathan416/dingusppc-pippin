@@ -34,6 +34,23 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <machines/machinefactory.h>
 #include <utils/profiler.h>
 #include <main.h>
+#include <main_cpu_owner.h>
+#include <atomic>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <functional>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
+#ifdef __linux__
+#include <pthread.h>
+#include <sys/syscall.h>
+#endif
 
 #include <chrono>
 #include <cinttypes>
@@ -52,14 +69,228 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #endif
 using namespace std;
 
+namespace pippin_cpu_owner {
+namespace {
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "CPU-owner signal requests require lock-free atomic bool");
+struct MainJob {
+    std::function<void()> fn;
+    bool synchronous = false;
+    bool finished = false;
+    std::exception_ptr error;
+    std::mutex mutex;
+    std::condition_variable changed;
+};
+struct OwnerState {
+    bool enable = false;
+    std::thread::id main_thread;
+    std::atomic<bool> running{false}, stop{false}, done{false};
+    std::atomic<uint64_t> guest_ns{0};
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<std::shared_ptr<MainJob>> main_jobs;
+    std::deque<std::function<void()>> guest_jobs;
+    std::exception_ptr error;
+    uint64_t guest_posted = 0, guest_run = 0, main_run = 0;
+    size_t guest_peak = 0, main_peak = 0;
+} owner;
+thread_local bool worker_thread = false;
+constexpr size_t main_capacity = 64, guest_capacity = 4096;
+uint64_t current_tid() {
+#ifdef __linux__
+    return uint64_t(syscall(SYS_gettid));
+#else
+    return uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+}
+void name_current_thread(const char *name) {
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), name);
+#else
+    (void)name;
+#endif
+}
+void remember_error(std::exception_ptr error) {
+    std::lock_guard<std::mutex> lock(owner.mutex);
+    if (!owner.error) owner.error = error;
+    owner.stop.store(true, std::memory_order_relaxed);
+}
+void enqueue_main(const std::shared_ptr<MainJob>& job) {
+    {
+        std::lock_guard<std::mutex> lock(owner.mutex);
+        if (owner.main_jobs.size() >= main_capacity) {
+            owner.stop.store(true, std::memory_order_relaxed);
+            throw std::runtime_error("CPU-owner main job queue overflow");
+        }
+        owner.main_jobs.push_back(job);
+        owner.main_peak = std::max(owner.main_peak, owner.main_jobs.size());
+    }
+    owner.changed.notify_one();
+}
+void service_main_jobs() {
+    if (!is_main_thread()) throw std::runtime_error("CPU-owner main job on wrong thread");
+    // Work posted during presentation belongs to the next pump iteration, so
+    // continuous frame production cannot starve SDL input/quit capture.
+    std::deque<std::shared_ptr<MainJob>> batch;
+    { std::lock_guard<std::mutex> lock(owner.mutex); batch.swap(owner.main_jobs); }
+    for (auto& job : batch) {
+        std::exception_ptr error;
+        try { job->fn(); } catch (...) { error = std::current_exception(); }
+        ++owner.main_run;
+        if (job->synchronous) {
+            {
+                std::lock_guard<std::mutex> lock(job->mutex);
+                job->error = error;
+                job->finished = true;
+            }
+            job->changed.notify_one();
+        } else if (error) {
+            remember_error(error);
+        }
+    }
+}
+void term_request(int) {
+    // No locks, SDL, guest state, or condition-variable operation in a handler.
+    owner.stop.store(true, std::memory_order_relaxed);
+}
+}
+void initialize(bool enable) {
+    if (active()) throw std::runtime_error("CPU-owner initialized while active");
+    owner.main_thread = std::this_thread::get_id();
+    owner.enable = enable;
+}
+bool enabled() noexcept { return owner.enable; }
+bool active() noexcept { return owner.running.load(std::memory_order_acquire); }
+bool is_main_thread() noexcept { return std::this_thread::get_id() == owner.main_thread; }
+bool is_worker_thread() noexcept { return worker_thread; }
+void request_stop() noexcept { owner.stop.store(true, std::memory_order_relaxed); }
+bool request_stop_if_active() noexcept {
+    if (!owner.running.load(std::memory_order_relaxed)) return false;
+    owner.stop.store(true, std::memory_order_relaxed);
+    return true;
+}
+void call_main(std::function<void()> fn) {
+    if (!active() || is_main_thread()) { fn(); return; }
+    if (!is_worker_thread()) throw std::runtime_error("CPU-owner unknown main-job caller");
+    auto job = std::make_shared<MainJob>();
+    job->fn = std::move(fn); job->synchronous = true;
+    enqueue_main(job);
+    std::unique_lock<std::mutex> lock(job->mutex);
+    job->changed.wait(lock, [&] { return job->finished; });
+    if (job->error) std::rethrow_exception(job->error);
+}
+void post_main(std::function<void()> fn) {
+    if (!active() || is_main_thread()) { fn(); return; }
+    if (!is_worker_thread()) throw std::runtime_error("CPU-owner unknown main-post caller");
+    auto job = std::make_shared<MainJob>(); job->fn = std::move(fn); enqueue_main(job);
+}
+void post_guest(std::function<void()> fn) {
+    if (!active() || is_worker_thread()) { fn(); return; }
+    if (!is_main_thread()) throw std::runtime_error("CPU-owner unknown guest-post caller");
+    std::lock_guard<std::mutex> lock(owner.mutex);
+    if (owner.guest_jobs.size() >= guest_capacity) {
+        owner.stop.store(true, std::memory_order_relaxed);
+        throw std::runtime_error("CPU-owner input queue overflow; stopping without dropping a successful input");
+    }
+    owner.guest_jobs.push_back(std::move(fn)); ++owner.guest_posted;
+    owner.guest_peak = std::max(owner.guest_peak, owner.guest_jobs.size());
+}
+void publish_guest_time() {
+    if (active() && !is_worker_thread())
+        throw std::runtime_error("CPU-owner guest time published by non-owner");
+    owner.guest_ns.store(get_virt_time_ns(), std::memory_order_release);
+}
+void drain_guest() {
+    if (!active() || !is_worker_thread())
+        throw std::runtime_error("CPU-owner guest drain on wrong thread");
+    // One bounded FIFO batch per original guest polling callback. Jobs may
+    // synchronously request main work, but never hold this mutex while doing so.
+    std::deque<std::function<void()>> batch;
+    { std::lock_guard<std::mutex> lock(owner.mutex); batch.swap(owner.guest_jobs); }
+    for (auto& job : batch) { job(); ++owner.guest_run; }
+    if (owner.stop.load(std::memory_order_relaxed)) power_off(po_quit);
+    publish_guest_time();
+}
+void run(std::function<void()> guest_code) {
+    if (!enabled() || !is_main_thread() || active())
+        throw std::runtime_error("CPU-owner invalid launch state");
+    {
+        std::lock_guard<std::mutex> lock(owner.mutex);
+        if (!owner.main_jobs.empty() || !owner.guest_jobs.empty())
+            throw std::runtime_error("CPU-owner stale work before launch");
+        owner.error = nullptr; owner.guest_posted = owner.guest_run = owner.main_run = 0;
+        owner.guest_peak = owner.main_peak = 0;
+    }
+    owner.stop.store(false, std::memory_order_relaxed);
+    owner.done.store(false, std::memory_order_relaxed);
+    publish_guest_time();
+    const uint64_t main_tid = current_tid();
+    name_current_thread("pippin-sdl");
+    auto old_term = std::signal(SIGTERM, term_request);
+    if (old_term == SIG_ERR) throw std::runtime_error("CPU-owner SIGTERM installation failed");
+    owner.running.store(true, std::memory_order_release);
+    std::thread worker;
+    try {
+        worker = std::thread([main_tid, guest_code = std::move(guest_code)] {
+            worker_thread = true; name_current_thread("pippin-cpu");
+            fprintf(stderr, "PIPPIN-CPU-OWNER start schema=1 main_tid=%llu worker_tid=%llu\n",
+                    (unsigned long long)main_tid, (unsigned long long)current_tid());
+            try { guest_code(); publish_guest_time(); }
+            catch (...) { remember_error(std::current_exception()); }
+            owner.done.store(true, std::memory_order_release);
+            owner.changed.notify_one(); worker_thread = false;
+        });
+    } catch (...) {
+        owner.running.store(false, std::memory_order_release);
+        std::signal(SIGTERM, old_term); throw;
+    }
+    // Keep servicing synchronous UI requests even after a stop/error request.
+    // Joining early would deadlock a worker waiting for call_main completion.
+    while (!owner.done.load(std::memory_order_acquire)) {
+        if (!owner.stop.load(std::memory_order_relaxed)) {
+            try { EventManager::get_instance()->capture_host_events(); }
+            catch (...) { remember_error(std::current_exception()); }
+        }
+        service_main_jobs();
+        std::unique_lock<std::mutex> lock(owner.mutex);
+        owner.changed.wait_for(lock, std::chrono::milliseconds(1), [] {
+            return owner.done.load(std::memory_order_acquire) || !owner.main_jobs.empty();
+        });
+    }
+    service_main_jobs();
+    worker.join();
+    // The worker cannot publish more callbacks after join. Complete all prior
+    // async frame jobs before the caller can destroy a Display or its device.
+    service_main_jobs();
+    std::exception_ptr error; size_t abandoned;
+    {
+        std::lock_guard<std::mutex> lock(owner.mutex);
+        error = owner.error; abandoned = owner.guest_jobs.size(); owner.guest_jobs.clear();
+    }
+    owner.running.store(false, std::memory_order_release);
+    std::signal(SIGTERM, old_term);
+    fprintf(stderr, "PIPPIN-CPU-OWNER stop schema=1 guest_posted=%llu guest_run=%llu main_run=%llu guest_peak=%zu main_peak=%zu shutdown_pending=%zu failure=%u\n",
+            (unsigned long long)owner.guest_posted, (unsigned long long)owner.guest_run,
+            (unsigned long long)owner.main_run, owner.guest_peak, owner.main_peak, abandoned, unsigned(bool(error)));
+    if (error) std::rethrow_exception(error);
+}
+}
+extern "C" uint64_t pippin_cpu_owner_guest_time_ns() noexcept {
+    return pippin_cpu_owner::owner.guest_ns.load(std::memory_order_acquire);
+}
+
+
 extern bool g_auto_grab_mouse;
 extern bool g_swap_command_option;
 
 static void sigint_handler(int signum) {
+    if (pippin_cpu_owner::request_stop_if_active()) return;
     power_off(po_signal_interrupt);
 }
 
 static void sigabrt_handler(int signum) {
+    // A fatal worker signal must never destroy SDL/device objects concurrently.
+    if (pippin_cpu_owner::active()) std::_Exit(128 + signum);
     LOG_F(INFO, "Shutting down...");
 
     delete gMachineObj.release();
@@ -265,6 +496,19 @@ int main(int argc, char** argv) {
         execution_mode = debugger;
     }
 
+    const char* owner_option = std::getenv("SHEEP_CPU_OWNER");
+    const bool owner_on = owner_option && std::strcmp(owner_option, "on") == 0;
+    if (owner_option && !owner_on && std::strcmp(owner_option, "off") != 0) {
+        std::cerr << "SHEEP_CPU_OWNER must be on or off\n";
+        return 1;
+    }
+    if (owner_on && execution_mode != interpreter) {
+        std::cerr << "SHEEP_CPU_OWNER=on requires run mode; interactive debugger stays on the serial path\n";
+        return 1;
+    }
+    pippin_cpu_owner::initialize(owner_on);
+
+
     if (auto start_time = parse_start_date(start_date, is_deterministic))
         ViaCuda::set_start_time(*start_time);
 
@@ -357,6 +601,10 @@ int main(int argc, char** argv) {
         // Make sure the reason for the failure is visible (it may have been
         // sent to the logfile only).
         cerr << message.preamble << message.indentation << message.prefix << message.message << endl;
+        // In the pilot a fatal error may originate on the worker. Fail the
+        // private process instead of entering stdin or deleting live SDL/device
+        // state on that thread. Ordinary shutdown still joins and persists.
+        if (pippin_cpu_owner::active()) std::_Exit(1);
         set_power_off_reason(po_enter_debugger);
         DppcDebugger::get_instance()->enter_debugger();
 
@@ -373,14 +621,30 @@ int main(int argc, char** argv) {
     keyboard_id = kbd_map.at(keyboard_string);
 
     while (true) {
-        run_machine(
-            machine_str,
-            &rom_data[0],
-            rom_size,
-            execution_mode,
-            env_vars,
-            deterministic_interactive,
-            profiling_interval_ms);
+        try {
+            run_machine(
+                machine_str,
+                &rom_data[0],
+                rom_size,
+                execution_mode,
+                env_vars,
+                deterministic_interactive,
+                profiling_interval_ms);
+        } catch (const std::exception& error) {
+            std::cerr << "CPU-owner failure: " << error.what() << std::endl;
+            TimerManager::get_instance()->cancel_all_timers();
+            EventManager::get_instance()->disconnect_handlers();
+            delete gMachineObj.release();
+            cleanup();
+            return 1;
+        } catch (...) {
+            std::cerr << "CPU-owner failure: unknown exception" << std::endl;
+            TimerManager::get_instance()->cancel_all_timers();
+            EventManager::get_instance()->disconnect_handlers();
+            delete gMachineObj.release();
+            cleanup();
+            return 1;
+        }
         if (power_off_reason == po_restarting) {
             LOG_F(INFO, "Restarting...");
             power_on = true;
@@ -486,7 +750,26 @@ void run_machine(std::string machine_str, char* rom_data,
     }
 #endif
 
-    switch (execution_mode) {
+    if (pippin_cpu_owner::enabled()) {
+        // Match the debugger's automatic "go" path without allowing a worker
+        // to enter blocking stdin. All guest state below is worker-owned.
+        pippin_cpu_owner::run([] {
+            set_power_off_reason(po_none);
+            power_on = true;
+            ppc_exec();
+            if (power_off_reason == po_shut_down) set_power_off_reason(po_shutting_down);
+            else if (power_off_reason == po_restart) set_power_off_reason(po_restarting);
+            else if (power_off_reason == po_quit) set_power_off_reason(po_quitting);
+        });
+        // A debugger/disassembly request is an explicit ownership transfer:
+        // after join, return to the unchanged main-thread serial debugger.
+        if (power_off_reason != po_shutting_down && power_off_reason != po_restarting &&
+            power_off_reason != po_quitting) {
+            LOG_F(INFO, "CPU-owner returning to serial debugger");
+            pippin_cpu_owner::initialize(false);
+            DppcDebugger::get_instance()->enter_debugger();
+        }
+    } else switch (execution_mode) {
     case interpreter:
         set_power_off_reason(po_starting_up);
         DppcDebugger::get_instance()->enter_debugger();

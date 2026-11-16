@@ -83,6 +83,8 @@ void AwacsBase::dma_out_start() {
         if ((err = snd_server->start_out_stream())) {
             LOG_F(ERROR, "%s: could not start sound output stream: %d",
                   this->name.c_str(), err);
+        } else {
+            this->out_stream_running = true;
         }
     }
 }

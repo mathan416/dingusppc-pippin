@@ -21,10 +21,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <devices/video/display.h>
 #include <devices/video/videoctrl.h>
+#include <devices/video/taos.h>
+#include <devices/video/frame_pixel_pool.h>
+#include <main_cpu_owner.h>
 #include <SDL.h>
 #include <loguru.hpp>
 #include <cmath>
 #include <string>
+#include <cstring>
+#include <cstdlib>
+#include <cstdint>
+#include <limits>
+#include <mutex>
+#include <stdexcept>
+#include <vector>
 
 bool g_auto_grab_mouse = false;
 
@@ -41,6 +51,68 @@ static const char * get_full_screen_mode_string(int scale_mode) {
 
 class Display::Impl {
 public:
+    struct CursorImage {
+        int width = 0, height = 0;
+        std::vector<uint32_t> pixels;
+    };
+    struct Frame {
+        uint64_t generation = 0;
+        int width = 0, height = 0;
+        bool draw_cursor = false;
+        int cursor_x = 0, cursor_y = 0;
+        std::vector<uint32_t> pixels;
+        std::shared_ptr<const CursorImage> cursor;
+        std::unique_ptr<const pippin_indexed::Snapshot> indexed;
+    };
+    struct PooledFrame {
+        uint64_t generation = 0;
+        bool draw_cursor = false;
+        int cursor_x = 0, cursor_y = 0;
+        std::shared_ptr<const CursorImage> cursor;
+        pippin_frame_pool::FramePixelPool::ReadyLease pixels;
+    };
+    // A main-thread callback holds this lifetime token, never a guest callback
+    // or a pointer into VRAM. At most one frame waits while another presents.
+    struct Mailbox {
+        std::mutex mutex;
+        std::shared_ptr<const Frame> latest;
+        std::unique_ptr<PooledFrame> pool_latest;
+        Display* owner = nullptr;
+        bool scheduled = false;
+        uint64_t generation = 0, submitted = 0, replaced = 0;
+        uint64_t presented = 0, blanked = 0, stale = 0;
+    };
+    std::shared_ptr<Mailbox> mailbox = std::make_shared<Mailbox>();
+    // Startup option is immutable; pool-off retains the Q156 allocation path.
+    bool pool_enabled = false;
+    bool raw_enabled = false;
+    uint64_t raw_submitted = 0, raw_presented = 0, raw_bytes = 0, raw_fallback = 0;
+    bool pool_qualified = false;
+    std::unique_ptr<pippin_frame_pool::FramePixelPool> pixel_pool;
+    uint64_t pool_modes = 0;
+    uint64_t old_acquired = 0, old_published = 0, old_reads = 0;
+    uint64_t old_released = 0, old_exhausted = 0;
+    void configure_pool(int width, int height) {
+        if (pixel_pool && pixel_pool->width() == width && pixel_pool->height() == height) return;
+        if (pixel_pool) {
+            const auto counts = pixel_pool->stats();
+            // The main configure barrier has completed any old read lease.
+            if (counts.states[unsigned(pippin_frame_pool::FramePixelPool::SlotState::free)] != 3)
+                throw std::logic_error("Frame-pixel mode change with an active lease");
+            old_acquired += counts.acquired; old_published += counts.published;
+            old_reads += counts.reads; old_released += counts.released;
+            old_exhausted += counts.exhausted;
+        }
+        pixel_pool = std::make_unique<pippin_frame_pool::FramePixelPool>(width, height);
+        ++pool_modes;
+    }
+    // Guest owner only (initial values are set before the worker starts).
+    int frame_w = 0, frame_h = 0;
+    bool guest_blanked = false;
+    std::shared_ptr<const CursorImage> guest_cursor;
+    // Main owner only.
+    std::shared_ptr<const CursorImage> uploaded_cursor;
+
     uint32_t        disp_wnd_id = 0;
     SDL_Window*     display_wnd = 0;
     SDL_Renderer*   renderer = 0;
@@ -63,10 +135,52 @@ public:
 };
 
 Display::Display(): impl(std::make_unique<Impl>()) {
+    const char* raw_option = std::getenv("SHEEP_RAW_FRAME");
+    if (raw_option && std::strcmp(raw_option, "on") && std::strcmp(raw_option, "off"))
+        throw std::invalid_argument("SHEEP_RAW_FRAME must be on or off");
+    impl->raw_enabled = raw_option && !std::strcmp(raw_option, "on");
+    const char* pool_option = std::getenv("SHEEP_FRAME_POOL");
+    if (pool_option && std::strcmp(pool_option, "on") && std::strcmp(pool_option, "off"))
+        throw std::invalid_argument("SHEEP_FRAME_POOL must be on or off");
+    impl->pool_enabled = pippin_cpu_owner::enabled() && (!pool_option || !std::strcmp(pool_option, "on"));
+    impl->mailbox->owner = this;
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
 }
 
 Display::~Display() {
+    // run() joins the guest owner and drains main jobs before device teardown.
+    if (pippin_cpu_owner::active() && !pippin_cpu_owner::is_main_thread())
+        ABORT_F("Display destroyed away from the SDL owner");
+    {
+        std::lock_guard<std::mutex> lock(impl->mailbox->mutex);
+        impl->mailbox->owner = nullptr;
+        impl->mailbox->latest.reset();
+        impl->mailbox->pool_latest.reset();
+    }
+    if (pippin_cpu_owner::enabled()) {
+        LOG_F(INFO, "CPU-OWNER-RAW-FRAME enabled=%u submitted=%llu presented=%llu bytes=%llu fallback=%llu",
+            unsigned(impl->raw_enabled && !impl->pool_enabled),
+            (unsigned long long)impl->raw_submitted, (unsigned long long)impl->raw_presented,
+            (unsigned long long)impl->raw_bytes, (unsigned long long)impl->raw_fallback);
+        const auto& q = *impl->mailbox;
+        LOG_F(INFO, "CPU-OWNER-DISPLAY submitted=%llu presented=%llu replaced=%llu blanked=%llu stale=%llu",
+            (unsigned long long)q.submitted, (unsigned long long)q.presented,
+            (unsigned long long)q.replaced, (unsigned long long)q.blanked,
+            (unsigned long long)q.stale);
+    }
+
+    if (pippin_cpu_owner::enabled()) {
+        const auto counts = impl->pixel_pool ? impl->pixel_pool->stats() : pippin_frame_pool::FramePixelPool::Stats{};
+        LOG_F(INFO, "CPU-OWNER-FRAME-POOL enabled=%u modes=%llu large_allocations=%llu acquisitions=%llu publishes=%llu reads=%llu releases=%llu exhausted=%llu",
+            unsigned(impl->pool_enabled), (unsigned long long)impl->pool_modes,
+            (unsigned long long)(impl->pool_modes * 3),
+            (unsigned long long)(impl->old_acquired + counts.acquired),
+            (unsigned long long)(impl->old_published + counts.published),
+            (unsigned long long)(impl->old_reads + counts.reads),
+            (unsigned long long)(impl->old_released + counts.released),
+            (unsigned long long)(impl->old_exhausted + counts.exhausted));
+    }
+
     if (impl->cursor_texture) {
         SDL_DestroyTexture(impl->cursor_texture);
         impl->cursor_texture = 0;
@@ -91,6 +205,34 @@ Display::~Display() {
 const double scale_step = std::pow(2.0, 1.0/8.0);
 
 bool Display::configure(int width, int height) {
+    if (pippin_cpu_owner::active() && pippin_cpu_owner::is_worker_thread()) {
+        impl->frame_w = width;
+        impl->frame_h = height;
+        impl->guest_blanked = false;
+        // Only Taos has the audited full-frame 8/15-bit conversion contract.
+        impl->pool_qualified = impl->pool_enabled && dynamic_cast<TaosVideo*>(video_ctrl) != nullptr;
+        {
+            std::lock_guard<std::mutex> lock(impl->mailbox->mutex);
+            ++impl->mailbox->generation;
+            impl->mailbox->latest.reset();
+            impl->mailbox->pool_latest.reset();
+            impl->mailbox->scheduled = false;
+        }
+        bool initialized = false;
+        pippin_cpu_owner::call_main([this, width, height, &initialized] {
+            initialized = this->configure(width, height);
+        });
+        if (impl->pool_qualified) impl->configure_pool(width, height);
+        return initialized;
+    }
+    // Startup and the serial control both configure on the main thread.
+    // While active, frame_w/frame_h belong exclusively to the guest worker.
+    if (!pippin_cpu_owner::active()) {
+        impl->frame_w = width;
+        impl->frame_h = height;
+        impl->pool_qualified = impl->pool_enabled && dynamic_cast<TaosVideo*>(video_ctrl) != nullptr;
+        if (impl->pool_qualified) impl->configure_pool(width, height);
+    }
     bool is_initialization = false;
 
     impl->display_w = width;
@@ -282,7 +424,28 @@ void Display::configure_texture() {
         ABORT_F("Display: SDL_CreateTexture failed with %s", SDL_GetError());
 }
 
+void Display::apply_guest_dirty(unsigned dirty) {
+    if (dirty & 1) video_ctrl->set_draw_fb();
+    if (dirty & 2) video_ctrl->set_cursor_dirty();
+}
+
 void Display::handle_events(const WindowEvent& wnd_event) {
+    unsigned dirty = 0;
+    if (pippin_cpu_owner::active()) {
+        // Window signals are dispatched by the guest-owner event drain.
+        if (!pippin_cpu_owner::is_worker_thread())
+            throw std::logic_error("Display window event outside guest owner");
+        pippin_cpu_owner::call_main([this, wnd_event, &dirty] {
+            dirty = this->handle_events_main(wnd_event);
+        });
+    } else {
+        dirty = this->handle_events_main(wnd_event);
+    }
+    this->apply_guest_dirty(dirty);
+}
+
+unsigned Display::handle_events_main(const WindowEvent& wnd_event) {
+    unsigned dirty = 0;
     switch (wnd_event.sub_type) {
 
     case SDL_WINDOWEVENT_SIZE_CHANGED:
@@ -304,13 +467,13 @@ void Display::handle_events(const WindowEvent& wnd_event) {
             }
 
             this->update_window_title();
-            video_ctrl->set_draw_fb();
+            dirty |= 1;
         }
         break;
 
     case SDL_WINDOWEVENT_EXPOSED:
         if (wnd_event.window_id == impl->disp_wnd_id) {
-            video_ctrl->set_draw_fb();
+            dirty |= 1;
         }
         break;
 
@@ -346,8 +509,8 @@ if (g_auto_grab_mouse) {
 
             // We need the window/texture to be recreated to pick up the hint change.
             this->configure_texture();
-            video_ctrl->set_draw_fb();
-            video_ctrl->set_cursor_dirty();
+            dirty |= 1;
+            dirty |= 2;
         }
         break;
 
@@ -366,8 +529,8 @@ if (g_auto_grab_mouse) {
                 this->use_scale_full_screen = false;
 
             this->configure_dest();
-            video_ctrl->set_draw_fb();
-            video_ctrl->set_cursor_dirty();
+            dirty |= 1;
+            dirty |= 2;
         }
         break;
 
@@ -389,8 +552,8 @@ if (g_auto_grab_mouse) {
             }
 
             this->configure_dest();
-            video_ctrl->set_draw_fb();
-            video_ctrl->set_cursor_dirty();
+            dirty |= 1;
+            dirty |= 2;
         }
         break;
 
@@ -404,6 +567,7 @@ if (g_auto_grab_mouse) {
         break;
 
     }
+    return dirty;
 }
 
 void Display::toggle_mouse_grab()
@@ -461,6 +625,29 @@ void Display::update_window_title()
 }
 
 void Display::blank() {
+    if (pippin_cpu_owner::active() && pippin_cpu_owner::is_worker_thread()) {
+        // Preserve a blank transition as an ordered UI command. Repeated blank
+        // refreshes coalesce, but a subsequent unblank frame cannot erase it.
+        if (impl->guest_blanked) return;
+        impl->guest_blanked = true;
+        auto q = impl->mailbox;
+        {
+            std::lock_guard<std::mutex> lock(q->mutex);
+            ++q->generation;
+            if (q->latest || q->pool_latest) ++q->replaced;
+            q->latest.reset();
+            q->pool_latest.reset();
+            q->scheduled = false;
+            ++q->submitted;
+        }
+        pippin_cpu_owner::post_main([q] {
+            if (q->owner) {
+                q->owner->blank();
+                ++q->blanked;
+            }
+        });
+        return;
+    }
     SDL_SetRenderDrawColor(impl->renderer, 0, 0, 0, 255);
     SDL_RenderClear(impl->renderer);
     SDL_RenderPresent(impl->renderer);
@@ -470,6 +657,48 @@ void Display::update(std::function<void(uint8_t *dst_buf, int dst_pitch)> conver
                      std::function<void(uint8_t *dst_buf, int dst_pitch)> cursor_ovl_cb,
                      bool draw_hw_cursor, int cursor_x, int cursor_y,
                      bool fb_known_to_be_changed) {
+    if (pippin_cpu_owner::active() && !pippin_cpu_owner::is_worker_thread())
+        throw std::logic_error("Framebuffer conversion outside guest owner");
+    if (pippin_cpu_owner::active() && pippin_cpu_owner::is_worker_thread()) {
+        if (impl->raw_enabled && !impl->pool_enabled) ++impl->raw_fallback;
+        if (impl->pool_qualified) {
+            this->update_pooled(std::move(convert_fb_cb), std::move(cursor_ovl_cb),
+                                draw_hw_cursor, cursor_x, cursor_y);
+            return;
+        }
+        impl->guest_blanked = false;
+        const int width = impl->frame_w, height = impl->frame_h;
+        if (width <= 0 || height <= 0 || width > std::numeric_limits<int>::max() / 4 ||
+            size_t(width) > std::numeric_limits<size_t>::max() / size_t(height) / 4)
+            throw std::runtime_error("Invalid worker framebuffer dimensions");
+        auto frame = std::make_shared<Impl::Frame>();
+        frame->width = width;
+        frame->height = height;
+        frame->draw_cursor = draw_hw_cursor;
+        frame->cursor_x = cursor_x;
+        frame->cursor_y = cursor_y;
+        frame->cursor = impl->guest_cursor;
+        frame->pixels.resize(size_t(width) * size_t(height));
+        // These callbacks and all source bytes/palette reads stay guest-owned.
+        convert_fb_cb(reinterpret_cast<uint8_t*>(frame->pixels.data()), width * 4);
+        if (cursor_ovl_cb)
+            cursor_ovl_cb(reinterpret_cast<uint8_t*>(frame->pixels.data()), width * 4);
+        auto q = impl->mailbox;
+        bool schedule = false;
+        uint64_t generation;
+        {
+            std::lock_guard<std::mutex> lock(q->mutex);
+            frame->generation = generation = q->generation;
+            if (q->latest) ++q->replaced;
+            q->latest = std::move(frame);
+            ++q->submitted;
+            if (!q->scheduled) q->scheduled = schedule = true;
+        }
+        if (schedule) pippin_cpu_owner::post_main([q, generation] {
+            if (q->owner) q->owner->present_pending_frame(generation);
+        });
+        return;
+    }
     uint8_t*    dst_buf = nullptr;
     int         dst_pitch;
 
@@ -483,6 +712,82 @@ void Display::update(std::function<void(uint8_t *dst_buf, int dst_pitch)> conver
         cursor_ovl_cb(dst_buf, dst_pitch);
 
     SDL_UnlockTexture(impl->disp_texture);
+    this->render_frame(draw_hw_cursor, cursor_x, cursor_y);
+}
+
+bool Display::raw_frames_enabled() const {
+    return impl->raw_enabled && !impl->pool_enabled &&
+           pippin_cpu_owner::active() && pippin_cpu_owner::is_worker_thread();
+}
+
+void Display::update_raw(std::unique_ptr<const pippin_indexed::Snapshot> snapshot,
+                         bool draw_hw_cursor, int cursor_x, int cursor_y) {
+    if (!this->raw_frames_enabled() || !snapshot ||
+        snapshot->width() != impl->frame_w || snapshot->height() != impl->frame_h)
+        throw std::logic_error("Invalid raw framebuffer handoff");
+    impl->guest_blanked = false;
+    auto frame = std::make_shared<Impl::Frame>();
+    frame->width = snapshot->width(); frame->height = snapshot->height();
+    frame->draw_cursor = draw_hw_cursor;
+    frame->cursor_x = cursor_x; frame->cursor_y = cursor_y;
+    frame->cursor = impl->guest_cursor;
+    impl->raw_bytes += snapshot->raw_bytes();
+    frame->indexed = std::move(snapshot);
+    ++impl->raw_submitted;
+    auto q = impl->mailbox;
+    bool schedule = false;
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(q->mutex);
+        frame->generation = generation = q->generation;
+        if (q->latest) ++q->replaced;
+        q->latest = std::move(frame);
+        ++q->submitted;
+        if (!q->scheduled) q->scheduled = schedule = true;
+    }
+    if (schedule) pippin_cpu_owner::post_main([q, generation] {
+        if (q->owner) q->owner->present_pending_frame(generation);
+    });
+}
+
+void Display::update_pooled(std::function<void(uint8_t*, int)> convert_fb_cb,
+                            std::function<void(uint8_t*, int)> cursor_ovl_cb,
+                            bool draw_hw_cursor, int cursor_x, int cursor_y) {
+    impl->guest_blanked = false;
+    if (!impl->pixel_pool || impl->pixel_pool->width() != impl->frame_w ||
+            impl->pixel_pool->height() != impl->frame_h)
+        throw std::logic_error("Frame-pixel pool is not configured");
+    auto writing = impl->pixel_pool->try_acquire();
+    if (!writing) throw std::logic_error("No free slot in three-buffer frame-pixel pool");
+    // Selected Pippin Taos 8/15-bit callbacks write every output pixel before
+    // the partial cursor overlay. No clear/resize/allocation occurs per frame.
+    convert_fb_cb(reinterpret_cast<uint8_t*>(writing.pixels()), writing.pitch_bytes());
+    if (cursor_ovl_cb)
+        cursor_ovl_cb(reinterpret_cast<uint8_t*>(writing.pixels()), writing.pitch_bytes());
+    auto frame = std::make_unique<Impl::PooledFrame>();
+    frame->draw_cursor = draw_hw_cursor;
+    frame->cursor_x = cursor_x; frame->cursor_y = cursor_y;
+    frame->cursor = impl->guest_cursor;
+    frame->pixels = std::move(writing).publish();
+    auto q = impl->mailbox;
+    bool schedule = false;
+    uint64_t generation;
+    {
+        // Lock order is mailbox then pool (on discarded READY destruction).
+        // No pool operation retains its mutex while acquiring the mailbox.
+        std::lock_guard<std::mutex> lock(q->mutex);
+        frame->generation = generation = q->generation;
+        if (q->pool_latest) ++q->replaced;
+        q->pool_latest = std::move(frame);
+        ++q->submitted;
+        if (!q->scheduled) q->scheduled = schedule = true;
+    }
+    if (schedule) pippin_cpu_owner::post_main([q, generation] {
+        if (q->owner) q->owner->present_pending_pooled_frame(generation);
+    });
+}
+
+void Display::render_frame(bool draw_hw_cursor, int cursor_x, int cursor_y) {
     SDL_RenderClear(impl->renderer);
     SDL_RenderCopy(impl->renderer, impl->disp_texture, NULL, &impl->dest_rect);
 
@@ -537,12 +842,164 @@ if (g_auto_grab_mouse) {
     SDL_RenderPresent(impl->renderer);
 }
 
+void Display::present_pending_frame(uint64_t generation) {
+    std::shared_ptr<const Impl::Frame> frame;
+    {
+        std::lock_guard<std::mutex> lock(impl->mailbox->mutex);
+        if (generation != impl->mailbox->generation) {
+            ++impl->mailbox->stale;
+            return;
+        }
+        impl->mailbox->scheduled = false;
+        frame = std::move(impl->mailbox->latest);
+        if (!frame) return;
+        if (frame->generation != impl->mailbox->generation) {
+            ++impl->mailbox->stale;
+            return;
+        }
+    }
+    if (frame->width != impl->display_w || frame->height != impl->display_h) {
+        ++impl->mailbox->stale;
+        return;
+    }
+    uint8_t* dst = nullptr;
+    int pitch = 0;
+    if (SDL_LockTexture(impl->disp_texture, nullptr, reinterpret_cast<void**>(&dst), &pitch))
+        throw std::runtime_error(std::string("Worker framebuffer lock failed: ") + SDL_GetError());
+    if (!dst || pitch < frame->width * 4) {
+        SDL_UnlockTexture(impl->disp_texture);
+        throw std::runtime_error("Worker framebuffer texture has an invalid pitch");
+    }
+    if (frame->indexed) {
+        if (size_t(frame->height) > std::numeric_limits<size_t>::max() / size_t(pitch) ||
+            !frame->indexed->write_argb(dst, size_t(pitch) * size_t(frame->height), pitch)) {
+            SDL_UnlockTexture(impl->disp_texture);
+            throw std::runtime_error("Raw framebuffer destination rejected");
+        }
+    } else {
+        for (int y = 0; y < frame->height; ++y)
+            std::memcpy(dst + size_t(y) * pitch,
+                frame->pixels.data() + size_t(y) * frame->width, size_t(frame->width) * 4);
+    }
+    SDL_UnlockTexture(impl->disp_texture);
+    if (frame->cursor && frame->cursor != impl->uploaded_cursor) {
+        const auto& cursor = *frame->cursor;
+        if (impl->cursor_texture) SDL_DestroyTexture(impl->cursor_texture);
+        impl->cursor_texture = SDL_CreateTexture(impl->renderer, SDL_PIXELFORMAT_ARGB8888,
+            SDL_TEXTUREACCESS_STREAMING, cursor.width, cursor.height);
+        if (!impl->cursor_texture)
+            throw std::runtime_error(std::string("Worker cursor texture failed: ") + SDL_GetError());
+        SDL_SetTextureBlendMode(impl->cursor_texture, SDL_BLENDMODE_BLEND);
+        if (SDL_LockTexture(impl->cursor_texture, nullptr, reinterpret_cast<void**>(&dst), &pitch))
+            throw std::runtime_error(std::string("Worker cursor lock failed: ") + SDL_GetError());
+        if (!dst || pitch < cursor.width * 4) {
+            SDL_UnlockTexture(impl->cursor_texture);
+            throw std::runtime_error("Worker cursor texture has an invalid pitch");
+        }
+        for (int y = 0; y < cursor.height; ++y)
+            std::memcpy(dst + size_t(y) * pitch,
+                cursor.pixels.data() + size_t(y) * cursor.width, size_t(cursor.width) * 4);
+        SDL_UnlockTexture(impl->cursor_texture);
+        impl->uploaded_cursor = frame->cursor;
+    }
+    if (frame->cursor) {
+        impl->cursor_rect.w = frame->cursor->width * impl->renderer_scale_x;
+        impl->cursor_rect.h = frame->cursor->height * impl->renderer_scale_y;
+    }
+    this->render_frame(frame->draw_cursor, frame->cursor_x, frame->cursor_y);
+    if (frame->indexed) ++impl->raw_presented;
+    ++impl->mailbox->presented;
+}
+
+void Display::present_pending_pooled_frame(uint64_t generation) {
+    std::unique_ptr<Impl::PooledFrame> frame;
+    {
+        std::lock_guard<std::mutex> lock(impl->mailbox->mutex);
+        if (generation != impl->mailbox->generation) {
+            ++impl->mailbox->stale;
+            return;
+        }
+        impl->mailbox->scheduled = false;
+        frame = std::move(impl->mailbox->pool_latest);
+        if (!frame) return;
+        if (frame->generation != impl->mailbox->generation) {
+            ++impl->mailbox->stale;
+            return;
+        }
+    }
+    auto reading = std::move(frame->pixels).read();
+    if (reading.width() != impl->display_w || reading.height() != impl->display_h) {
+        ++impl->mailbox->stale;
+        return;
+    }
+    uint8_t* dst = nullptr;
+    int pitch = 0;
+    if (SDL_LockTexture(impl->disp_texture, nullptr, reinterpret_cast<void**>(&dst), &pitch))
+        throw std::runtime_error(std::string("Worker framebuffer lock failed: ") + SDL_GetError());
+    if (!dst || pitch < reading.width() * 4) {
+        SDL_UnlockTexture(impl->disp_texture);
+        throw std::runtime_error("Worker framebuffer texture has an invalid pitch");
+    }
+    for (int y = 0; y < reading.height(); ++y)
+        std::memcpy(dst + size_t(y) * pitch,
+            reading.pixels() + size_t(y) * reading.width(), size_t(reading.width()) * 4);
+    SDL_UnlockTexture(impl->disp_texture);
+    if (frame->cursor && frame->cursor != impl->uploaded_cursor) {
+        const auto& cursor = *frame->cursor;
+        if (impl->cursor_texture) SDL_DestroyTexture(impl->cursor_texture);
+        impl->cursor_texture = SDL_CreateTexture(impl->renderer, SDL_PIXELFORMAT_ARGB8888,
+            SDL_TEXTUREACCESS_STREAMING, cursor.width, cursor.height);
+        if (!impl->cursor_texture)
+            throw std::runtime_error(std::string("Worker cursor texture failed: ") + SDL_GetError());
+        SDL_SetTextureBlendMode(impl->cursor_texture, SDL_BLENDMODE_BLEND);
+        if (SDL_LockTexture(impl->cursor_texture, nullptr, reinterpret_cast<void**>(&dst), &pitch))
+            throw std::runtime_error(std::string("Worker cursor lock failed: ") + SDL_GetError());
+        if (!dst || pitch < cursor.width * 4) {
+            SDL_UnlockTexture(impl->cursor_texture);
+            throw std::runtime_error("Worker cursor texture has an invalid pitch");
+        }
+        for (int y = 0; y < cursor.height; ++y)
+            std::memcpy(dst + size_t(y) * pitch,
+                cursor.pixels.data() + size_t(y) * cursor.width, size_t(cursor.width) * 4);
+        SDL_UnlockTexture(impl->cursor_texture);
+        impl->uploaded_cursor = frame->cursor;
+    }
+    if (frame->cursor) {
+        impl->cursor_rect.w = frame->cursor->width * impl->renderer_scale_x;
+        impl->cursor_rect.h = frame->cursor->height * impl->renderer_scale_y;
+    }
+    this->render_frame(frame->draw_cursor, frame->cursor_x, frame->cursor_y);
+    ++impl->mailbox->presented;
+}
+
 void Display::update_skipped() {
     // SDL implementation does not care about skipped updates.
 }
 
 void Display::setup_hw_cursor(std::function<void(uint8_t *dst_buf, int dst_pitch)> draw_hw_cursor,
                               int cursor_width, int cursor_height) {
+    if (pippin_cpu_owner::active() && !pippin_cpu_owner::is_worker_thread())
+        throw std::logic_error("Cursor conversion outside guest owner");
+    if (pippin_cpu_owner::enabled()) {
+        if (cursor_width <= 0 || cursor_height <= 0 ||
+            cursor_width > std::numeric_limits<int>::max() / 4 ||
+            size_t(cursor_width) > std::numeric_limits<size_t>::max() / size_t(cursor_height) / 4)
+            throw std::runtime_error("Invalid worker cursor dimensions");
+        auto cursor = std::make_shared<Impl::CursorImage>();
+        cursor->width = cursor_width;
+        cursor->height = cursor_height;
+        cursor->pixels.resize(size_t(cursor_width) * size_t(cursor_height));
+        draw_hw_cursor(reinterpret_cast<uint8_t*>(cursor->pixels.data()), cursor_width * 4);
+        impl->guest_cursor = cursor;
+        if (pippin_cpu_owner::active() && pippin_cpu_owner::is_worker_thread()) return;
+        // Startup may configure a cursor before run(); consume the same owned
+        // image below instead of invoking the guest callback twice.
+        draw_hw_cursor = [cursor](uint8_t* dst, int pitch) {
+            for (int y = 0; y < cursor->height; ++y)
+                std::memcpy(dst + size_t(y) * pitch,
+                    cursor->pixels.data() + size_t(y) * cursor->width, size_t(cursor->width) * 4);
+        };
+    }
     uint8_t*    dst_buf = nullptr;
     int         dst_pitch;
 

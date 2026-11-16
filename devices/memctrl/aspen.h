@@ -35,6 +35,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <cinttypes>
 #include <memory>
+#include <devices/memctrl/pippinflash.h>
 
 /** Aspen register definitions. */
 enum {
@@ -75,6 +76,7 @@ public:
 
 private:
     int     map_phys_ram();
+    PippinFlash save_flash;
 
     uint8_t     gpio_enable = 0;
 

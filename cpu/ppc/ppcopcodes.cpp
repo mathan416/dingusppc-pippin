@@ -67,6 +67,7 @@ std::vector<CtxSyncCallback> gCtxSyncCallbacks;
 
 // perform context synchronization by executing registered actions if any
 void do_ctx_sync() {
+    sheep_mmu_rom_window_invalidate();
     while (!gCtxSyncCallbacks.empty()) {
         gCtxSyncCallbacks.back()();
         gCtxSyncCallbacks.pop_back();
@@ -74,6 +75,7 @@ void do_ctx_sync() {
 }
 
 void add_ctx_sync_action(const CtxSyncCallback& cb) {
+    sheep_mmu_rom_window_invalidate();
     gCtxSyncCallbacks.push_back(cb);
 }
 
@@ -755,6 +757,14 @@ void dppc_interpreter::ppc_mfmsr(uint32_t opcode) {
     ppc_state.gpr[reg_d] = ppc_state.msr;
 }
 
+// A context boundary must discard the dispatcher's cached host fetch pointer.
+// Preserve an already-established branch/exception/sleep destination.
+static inline void request_instruction_fetch() {
+    if (!(exec_flags & ~(EXEF_OPC_DECODER | EXEF_FETCH)))
+        ppc_next_instruction_address = ppc_state.pc + 4;
+    exec_flags |= EXEF_FETCH;
+}
+
 void dppc_interpreter::ppc_mtmsr(uint32_t opcode) {
 #ifdef CPU_PROFILING
     num_supervisor_instrs++;
@@ -770,6 +780,8 @@ void dppc_interpreter::ppc_mtmsr(uint32_t opcode) {
         ppc_change_endian((new_msr_val & MSR::LE) != 0);
     }
     ppc_msr_did_change(old_msr_val, new_msr_val);
+    if ((old_msr_val ^ new_msr_val) & (MSR::IR | MSR::PR))
+        request_instruction_fetch();
 
     // generate External Interrupt Exception
     // if CPU interrupt line is asserted
@@ -1608,6 +1620,7 @@ void dppc_interpreter::ppc_eieio(uint32_t opcode) {
 
 void dppc_interpreter::ppc_isync(uint32_t opcode) {
     do_ctx_sync();
+    request_instruction_fetch();
 }
 
 void dppc_interpreter::ppc_sync(uint32_t opcode) {

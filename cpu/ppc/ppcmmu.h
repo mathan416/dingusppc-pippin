@@ -108,4 +108,24 @@ extern T mmu_read_vmem(uint32_t opcode, uint32_t guest_va);
 template <class T>
 extern void mmu_write_vmem(uint32_t opcode, uint32_t guest_va, T value);
 
+// Q203 private, worker-owned instruction ROM window. The live object stays at
+// one address; revocation clears valid_start_count before any source mutation.
+struct alignas(8) SheepROMWindow {
+    uint32_t guest_start;
+    uint32_t valid_start_count; // byte length minus three; zero means invalid
+    uintptr_t host_offset;
+    uintptr_t cpu_base;
+};
+static_assert(sizeof(SheepROMWindow) == 24, "ROM window ABI must be 24 bytes");
+
+const SheepROMWindow* sheep_mmu_rom_window_get() noexcept;
+void sheep_mmu_rom_window_enable(bool enabled) noexcept;
+void sheep_mmu_rom_window_invalidate() noexcept;
+bool sheep_mmu_rom_window_cold_refresh(uint32_t pc,
+                                     const uint8_t* current_host) noexcept;
+int sheep_rom_window_selftest();
+// Startup fixtures only; begin/end journal canonical MMU state and current ROM.
+const uint8_t* sheep_mmu_rom_window_test_begin(uint32_t guest_start);
+void sheep_mmu_rom_window_test_end() noexcept;
+
 #endif    // PPCMMU_H

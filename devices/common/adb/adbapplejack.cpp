@@ -63,7 +63,7 @@ bool AdbAppleJack::get_register_0() {
     changed |= this->AdbMouse::get_register_0(mouse_buttons, changed);
     this->triggers_changed = false;
 
-    if (this->dev_handler_id == APPLEJACK_HANDLER_ID && this->buttons_changed) {
+    if (this->dev_handler_id == APPLEJACK_HANDLER_ID && changed) {
         uint8_t* out_buf = this->host_obj->get_output_buf();
 
         out_buf[2] = uint8_t(~this->aj_buttons_state >> 8);

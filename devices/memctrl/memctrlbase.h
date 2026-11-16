@@ -65,6 +65,13 @@ typedef struct AddressMapEntry {
 /** Base class for memory controllers. */
 class MemCtrlBase {
 public:
+    // Dedicated CPU observer; cannot replace another registered observer.
+    using InstructionMapObserver = void (*)(MemCtrlBase*, bool destroying) noexcept;
+    bool bind_instruction_map_observer(InstructionMapObserver observer) noexcept;
+    void unbind_instruction_map_observer(InstructionMapObserver observer) noexcept;
+    bool instruction_rom_span(const AddressMapEntry* region, uint32_t first,
+                              uint64_t byte_count) const noexcept;
+
     MemCtrlBase() = default;
     virtual ~MemCtrlBase();
     virtual AddressMapEntry* add_rom_region(uint32_t start_addr, uint32_t size);
@@ -113,6 +120,8 @@ protected:
                                            uint32_t offset=0, uint32_t size=0);
 
 private:
+    void notify_instruction_map_change(bool destroying = false) noexcept;
+    InstructionMapObserver instruction_map_observer = nullptr;
     std::vector<uint8_t*> mem_regions;
     std::vector<AddressMapEntry*> address_map;
 };

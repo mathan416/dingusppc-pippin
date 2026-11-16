@@ -234,6 +234,19 @@ void TaosVideo::disable_display() {
     this->crtc_on  = false;
 }
 
+std::unique_ptr<const pippin_indexed::Snapshot> TaosVideo::snapshot_indexed_frame() {
+    if (!this->vram_ptr || !this->fb_ptr ||
+        (this->pixel_depth != 8 && this->pixel_depth != 16))
+        return nullptr;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(this->vram_ptr);
+    const uintptr_t source = reinterpret_cast<uintptr_t>(this->fb_ptr);
+    if (source < base || source - base >= DRAM_CAP_1MB) return nullptr;
+    return pippin_indexed::Snapshot::capture(
+        this->pixel_depth == 8 ? pippin_indexed::Format::indexed8 : pippin_indexed::Format::taos15_be,
+        this->active_width, this->active_height, this->vram_ptr, DRAM_CAP_1MB,
+        source - base, this->fb_pitch, this->palette);
+}
+
 void TaosVideo::convert_frame_15bpp_indexed(uint8_t *dst_buf, int dst_pitch) {
     uint8_t     *src_row, *dst_row;
     uint16_t    c;

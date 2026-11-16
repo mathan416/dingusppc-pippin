@@ -80,6 +80,9 @@ public:
     void convert_frame_32bpp(uint8_t *dst_buf, int dst_pitch, bool swapper = false);
 
 protected:
+    virtual std::unique_ptr<const pippin_indexed::Snapshot> snapshot_indexed_frame() {
+        return nullptr;
+    }
 #if SUPPORTS_MEMORY_CTRL_ENDIAN_MODE
     virtual bool framebuffer_in_main_memory(void) {
         return false;

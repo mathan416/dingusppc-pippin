@@ -28,6 +28,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <devices/memctrl/memctrlbase.h>
 
 #include <cinttypes>
+#include <utility>
 
 VideoCtrlBase::VideoCtrlBase(int width, int height)
 {
@@ -80,6 +81,13 @@ void VideoCtrlBase::update_screen()
         if (this->cursor_dirty) {
             this->setup_hw_cursor();
             this->cursor_dirty = false;
+        }
+        if (!this->cursor_ovl_cb && this->display.raw_frames_enabled()) {
+            auto snapshot = this->snapshot_indexed_frame();
+            if (snapshot) {
+                this->display.update_raw(std::move(snapshot), this->cursor_on, cursor_x, cursor_y);
+                return;
+            }
         }
         this->display.update(
             this->convert_fb_cb, this->cursor_ovl_cb,

@@ -23,8 +23,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <core/memaccess.h>
 #include <devices/memctrl/memctrlbase.h>
+#include <devices/memctrl/aspen.h>
 #include <devices/common/mmiodevice.h>
 #include "ppcemu.h"
+#include "pippin_fastmem.h"
 #include "ppcmmu.h"
 
 #include <array>
@@ -32,6 +34,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <loguru.hpp>
 #include <stdexcept>
 #include <vector>
+#include <typeinfo>
+#include <cstddef>
 
 //#define MMU_PROFILING // uncomment this to enable MMU profiling
 //#define TLB_PROFILING // uncomment this to enable SoftTLB profiling
@@ -46,6 +50,45 @@ std::function<void(uint32_t bat_reg)> dbat_update;
 /** PowerPC-style MMU BAT arrays (NULL initialization isn't prescribed). */
 PPC_BAT_entry ibat_array[4] = {{0}};
 PPC_BAT_entry dbat_array[4] = {{0}};
+
+static SheepROMWindow sheep_rom_window{};
+static bool sheep_rom_window_enabled = false;
+static MemCtrlBase* sheep_rom_window_owner = nullptr;
+static_assert(offsetof(SheepROMWindow, guest_start) == 0 &&
+              offsetof(SheepROMWindow, valid_start_count) == 4 &&
+              offsetof(SheepROMWindow, host_offset) == 8 &&
+              offsetof(SheepROMWindow, cpu_base) == 16, "ROM window offsets");
+
+const SheepROMWindow* sheep_mmu_rom_window_get() noexcept { return &sheep_rom_window; }
+void sheep_mmu_rom_window_invalidate() noexcept {
+    // CPU worker owns both writers and consumers. No cross-thread snapshot.
+    sheep_rom_window.valid_start_count = 0;
+}
+static void sheep_rom_map_changed(MemCtrlBase* owner, bool destroying) noexcept {
+    if (owner != sheep_rom_window_owner) return;
+    sheep_mmu_rom_window_invalidate();
+    if (destroying) sheep_rom_window_owner = nullptr;
+}
+static bool sheep_rom_bind_owner() noexcept {
+    if (!mem_ctrl_instance || typeid(*mem_ctrl_instance) != typeid(AspenCtrl))
+        return false; // other controllers have direct descriptor writers
+    if (sheep_rom_window_owner == mem_ctrl_instance) return true;
+    if (sheep_rom_window_owner)
+        sheep_rom_window_owner->unbind_instruction_map_observer(&sheep_rom_map_changed);
+    sheep_rom_window_owner = nullptr;
+    if (!mem_ctrl_instance->bind_instruction_map_observer(&sheep_rom_map_changed)) return false;
+    sheep_rom_window_owner = mem_ctrl_instance;
+    return true;
+}
+void sheep_mmu_rom_window_enable(bool enabled) noexcept {
+    sheep_mmu_rom_window_invalidate();
+    sheep_rom_window_enabled = enabled;
+    if (!enabled && sheep_rom_window_owner) {
+        sheep_rom_window_owner->unbind_instruction_map_observer(&sheep_rom_map_changed);
+        sheep_rom_window_owner = nullptr;
+    }
+}
+
 
 #ifdef MMU_PROFILING
 
@@ -514,6 +557,10 @@ typedef struct TLBEntry {
     uint32_t phys_tag;
     uint32_t reserved;
 } TLBEntry;
+static void sheep_fast_invalidate(TLBEntry*);
+static void sheep_fast_publish(TLBEntry*);
+static void sheep_fast_select();
+static void sheep_fast_repair(unsigned,uint32_t);
 
 // Track slots populated by either page or block address translation. Context
 // changes can then invalidate only populated slots without adding a generation
@@ -546,6 +593,7 @@ static void tlb_invalidate_tracked_entries(std::vector<TLBEntry *> &tracked_entr
     for (TLBEntry *tlb_entry : tracked_entries) {
         uint16_t source = tlb_entry->flags & TLBE_FROM_TRANSLATION;
         if (source & sources) {
+            sheep_fast_invalidate(tlb_entry);
             tlb_entry->tag = TLB_INVALID_TAG;
             tlb_entry->flags &= ~TLBFlags::TLBE_CTX_TRACKED;
         } else if (source) {
@@ -580,6 +628,7 @@ static void tlb_invalidate_tracked_entries()
 
 static void schedule_tlb_invalidation(TLBType tlb_type, uint16_t sources_to_invalidate)
 {
+    sheep_mmu_rom_window_invalidate();
     uint16_t *pending_sources;
 
     if (tlb_type == TLBType::ITLB)
@@ -599,11 +648,13 @@ static void schedule_tlb_invalidation(TLBType tlb_type, uint16_t sources_to_inva
 template <const TLBType tlb_type>
 static void promote_tlb_entry(TLBEntry *tlb1_entry, const TLBEntry *tlb2_entry)
 {
+    if constexpr(tlb_type==TLBType::DTLB)sheep_fast_invalidate(tlb1_entry);
     uint16_t tracked = tlb1_entry->flags & TLBFlags::TLBE_CTX_TRACKED;
     *tlb1_entry = *tlb2_entry;
     tlb1_entry->flags &= ~TLBFlags::TLBE_CTX_TRACKED;
     tlb1_entry->flags |= tracked;
     track_translated_entry<tlb_type>(tlb1_entry);
+    if constexpr(tlb_type==TLBType::DTLB)sheep_fast_publish(tlb1_entry);
 }
 
 // primary ITLB for all MMU modes
@@ -631,6 +682,39 @@ TLBEntry *pCurITLB2; // current secondary ITLB
 TLBEntry *pCurDTLB1; // current primary DTLB
 TLBEntry *pCurDTLB2; // current secondary DTLB
 
+extern uint32_t tlb_size_mask;
+static TLBEntry *sheep_fast_owners[]={dtlb1_mode1.data(),dtlb1_mode2.data(),dtlb1_mode3.data()};
+static TLBEntry *sheep_fast_secondary[]={dtlb2_mode1.data(),dtlb2_mode2.data(),dtlb2_mode3.data()};
+static int sheep_fast_owner(const TLBEntry *entry){
+ uintptr_t address=reinterpret_cast<uintptr_t>(entry);
+ for(unsigned mode=0;mode<3;mode++)for(unsigned level=0;level<2;level++){
+  uintptr_t begin=reinterpret_cast<uintptr_t>(level?sheep_fast_secondary[mode]:sheep_fast_owners[mode]);size_t bytes=sizeof(TLBEntry)*TLB_SIZE*(level?TLB2_WAYS:1);
+  if(address>=begin&&address-begin<bytes&&(address-begin)%sizeof(TLBEntry)==0)return int(mode);
+ }return -1;
+}
+static void sheep_fast_refresh(unsigned mode,uint32_t va,const TLBEntry *ignore){
+ if(mode>=3||(va&4095))return;
+ unsigned index=(va>>12)&(TLB_SIZE-1);const TLBEntry *chosen=nullptr;
+ auto *primary=&sheep_fast_owners[mode][index];
+ if(primary!=ignore&&primary->tag==va)chosen=primary;
+ else for(unsigned way=0;way<TLB2_WAYS;way++){auto *entry=&sheep_fast_secondary[mode][index*TLB2_WAYS+way];if(entry!=ignore&&entry->tag==va){chosen=entry;break;}}
+ if(chosen)pippin_fastmem_publish(mode,index,va,chosen->flags,uintptr_t(chosen->host_va_offs_r)+va,uintptr_t(chosen->host_va_offs_w)+va);
+ else pippin_fastmem_revoke(mode,va);
+}
+static void sheep_fast_repair(unsigned mode,uint32_t va){sheep_fast_refresh(mode,va,nullptr);}
+static void sheep_fast_invalidate(TLBEntry *entry){
+ if(!pippin_fastmem_enabled())return;int mode=sheep_fast_owner(entry);if(mode<0)return;
+ sheep_fast_refresh(unsigned(mode),entry->tag,entry);
+}
+static void sheep_fast_publish(TLBEntry *entry){
+ if(!pippin_fastmem_enabled())return;int mode=sheep_fast_owner(entry);if(mode<0)return;
+ sheep_fast_refresh(unsigned(mode),entry->tag,nullptr);
+}
+static void sheep_fast_select(){
+ unsigned mode=3;if(tlb_size_mask==TLB_SIZE-1)for(unsigned i=0;i<3;i++)if(pCurDTLB1==sheep_fast_owners[i]){mode=i;break;}
+ pippin_fastmem_select(mode);
+}
+
 uint32_t tlb_size_mask = TLB_SIZE - 1;
 
 // fake TLB entry for handling of unmapped memory accesses
@@ -642,6 +726,7 @@ uint8_t     CurDTLBMode = {0xFF}; // current DTLB mode
 
 void mmu_change_mode()
 {
+    sheep_mmu_rom_window_invalidate();
     uint8_t mmu_mode;
 
     // switch ITLB tables first
@@ -689,6 +774,7 @@ void mmu_change_mode()
         }
         CurDTLBMode = mmu_mode;
     }
+    sheep_fast_select();
 }
 
 template <uint32_t way>
@@ -871,6 +957,7 @@ static TLBEntry* dtlb2_refill(uint32_t guest_va, int is_write, bool is_dbg = fal
     if (rgn_desc) {
         // refill the secondary TLB
         tlb_entry = tlb2_target_entry<TLBType::DTLB>(tag);
+        sheep_fast_invalidate(tlb_entry);
         tlb_entry->tag = tag;
         if (rgn_desc->type & RT_MMIO) { // MMIO region
             tlb_entry->flags = flags | TLBFlags::PAGE_IO |
@@ -891,6 +978,7 @@ static TLBEntry* dtlb2_refill(uint32_t guest_va, int is_write, bool is_dbg = fal
         }
         tlb_entry->phys_tag = phys_addr & ~0xFFFUL;
         track_translated_entry<TLBType::DTLB>(tlb_entry);
+        sheep_fast_publish(tlb_entry);
         return tlb_entry;
     } else {
         if (!is_dbg) {
@@ -979,6 +1067,7 @@ static inline bool prepare_dtlb_write(TLBEntry *tlb_entry, uint32_t guest_va)
     // Perform full page address translation to update the PTE.C bit.
     page_address_translation(guest_va, false, !!(ppc_state.msr & MSR::PR), true);
     tlb_entry->flags |= TLBFlags::PTE_SET_C;
+    sheep_fast_publish(tlb_entry);
     return true;
 }
 
@@ -1062,6 +1151,7 @@ uint8_t *mmu_translate_imem(uint32_t vaddr, uint32_t *paddr)
 
 void tlb_flush_all_pat()
 {
+    sheep_mmu_rom_window_invalidate();
 #ifdef MMU_PROFILING
     pat_flushes_total++;
 #endif
@@ -1072,6 +1162,7 @@ void tlb_flush_all_pat()
 
 static void mpc601_bat_update(uint32_t bat_reg)
 {
+    sheep_mmu_rom_window_invalidate();
     PPC_BAT_entry *ibat_entry, *dbat_entry;
     uint32_t bsm, hi_mask;
     int upper_reg_num;
@@ -1112,6 +1203,7 @@ static void mpc601_dbat_update(uint32_t /*bat_reg*/)
 
 static void ppc_ibat_update(uint32_t bat_reg)
 {
+    sheep_mmu_rom_window_invalidate();
     int upper_reg_num;
     uint32_t bl, hi_mask;
     PPC_BAT_entry* bat_entry;
@@ -1187,7 +1279,7 @@ template <class T>
 static void write_unaligned(uint32_t opcode, uint32_t guest_va, uint8_t *host_va, T value ARGS_SWAP_MUNGED);
 
 template <class T>
-inline T mmu_read_vmem(uint32_t opcode, uint32_t guest_va)
+__attribute__((noinline)) static T mmu_read_vmem_slow(uint32_t opcode, uint32_t guest_va)
 {
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE || SUPPORTS_MEMORY_CTRL_ENDIAN_MODE
     bool munged = false;
@@ -1349,6 +1441,27 @@ inline T mmu_read_vmem(uint32_t opcode, uint32_t guest_va)
 #endif
                 (READ_QWORD_BE_A(host_va));
     }
+}
+
+// A leaf primary hit before the original out-of-line MMU implementation.
+static inline uint8_t *sheep_primary_read_host(uint32_t va,unsigned size){
+#if defined(__aarch64__) && __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__ && !SUPPORTS_PPC_LITTLE_ENDIAN_MODE && !SUPPORTS_MEMORY_CTRL_ENDIAN_MODE && !defined(MMU_PROFILING) && !defined(TLB_PROFILING) && !defined(LOG_INSTRUCTIONS)
+ if(va&(size-1))return nullptr;
+ auto *entry=&pCurDTLB1[(va>>PPC_PAGE_SIZE_BITS)&tlb_size_mask];
+ if(entry->tag!=(va&PPC_PAGE_MASK)||!(entry->flags&TLBFlags::PAGE_MEM))return nullptr;
+ return reinterpret_cast<uint8_t*>(entry->host_va_offs_r+va);
+#else
+ return nullptr;
+#endif
+}
+template<class T> inline T mmu_read_vmem(uint32_t opcode,uint32_t va){
+ if(auto *host=sheep_primary_read_host(va,sizeof(T))){
+  if constexpr(sizeof(T)==1)return *host;
+  if constexpr(sizeof(T)==2)return READ_WORD_BE_A(host);
+  if constexpr(sizeof(T)==4)return READ_DWORD_BE_A(host);
+  if constexpr(sizeof(T)==8)return READ_QWORD_BE_A(host);
+ }
+ return mmu_read_vmem_slow<T>(opcode,va);
 }
 
 // explicitely instantiate all required mmu_read_vmem variants
@@ -1983,6 +2096,7 @@ bool mmu_translate_dbg(uint32_t guest_va, uint32_t &guest_pa) {
 template <std::size_t N>
 static void invalidate_tlb_entries(std::array<TLBEntry, N> &tlb) {
     for (auto &tlb_el : tlb) {
+        sheep_fast_invalidate(&tlb_el);
         tlb_el.tag = TLB_INVALID_TAG;
         tlb_el.flags = 0;
         tlb_el.lru_bits = 0;
@@ -1995,6 +2109,7 @@ static void invalidate_tlb_entries(std::array<TLBEntry, N> &tlb) {
 
 void ppc_mmu_init()
 {
+    sheep_mmu_rom_window_enable(false);
     gPendingIInvalidationSources = 0;
     gPendingDInvalidationSources = 0;
     gTrackedIEntries.clear();
@@ -2047,3 +2162,300 @@ void ppc_mmu_init()
     std::unique_ptr<BaseProfile>(new TLBProfile()));
 #endif
 }
+
+// Experimental JIT: return only an existing primary RAM mapping. No refill,
+// exception, MMIO access, permission change or PTE dirty-bit side effect here.
+uint8_t *sheep_mmu_fastmem(uint32_t va,unsigned size,bool write)
+{
+ if((size!=1&&size!=2&&size!=4)||((va&4095)+size>4096))return nullptr;
+#if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
+ if(ppc_state.is_LE)return nullptr;
+#endif
+#if SUPPORTS_MEMORY_CTRL_ENDIAN_MODE
+ if(mem_ctrl_instance->needs_swap_endian(false))return nullptr;
+#endif
+ auto *entry=&pCurDTLB1[(va>>PPC_PAGE_SIZE_BITS)&tlb_size_mask];
+ if(entry->tag!=(va&PPC_PAGE_MASK)||!(entry->flags & TLBFlags::PAGE_MEM))return nullptr;
+ if(write && ((entry->flags & (TLBFlags::PAGE_WRITABLE|TLBFlags::PTE_SET_C)) != (TLBFlags::PAGE_WRITABLE|TLBFlags::PTE_SET_C)))return nullptr;
+ return reinterpret_cast<uint8_t*>((write?entry->host_va_offs_w:entry->host_va_offs_r)+va);
+}
+
+#include "nw_jit.h"
+#include <cstddef>
+void sheep_mmu_jit_layout(nw_jit_layout *layout)
+{
+#if !SUPPORTS_PPC_LITTLE_ENDIAN_MODE && !SUPPORTS_MEMORY_CTRL_ENDIAN_MODE
+ static_assert(sizeof(TLBEntry)==32 && alignof(TLBEntry)>=8 && offsetof(TLBEntry,tag)==0 && offsetof(TLBEntry,flags)==4 && offsetof(TLBEntry,lru_bits)==6);
+ static_assert(__BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__, "Fused TLB word requires little-endian host");
+ static_assert(offsetof(TLBEntry,host_va_offs_r)==8 && offsetof(TLBEntry,host_va_offs_w)==16);
+ static_assert(TLBFlags::PAGE_MEM==1 && TLBFlags::PAGE_WRITABLE==32 && TLBFlags::PTE_SET_C==64);
+ layout->dtlb_slot=reinterpret_cast<uintptr_t>(&pCurDTLB1);
+ layout->tlb_mask=reinterpret_cast<uintptr_t>(&tlb_size_mask);
+ pippin_fastmem_mmu(reinterpret_cast<uintptr_t>(&pCurDTLB2),reinterpret_cast<uintptr_t>(&tlb_size_mask));
+ pippin_fastmem_refresher(sheep_fast_repair);
+ sheep_fast_select();
+ if(pippin_fastmem_enabled()){layout->fast_read_slot=reinterpret_cast<uintptr_t>(&pippin_fastmem_read);layout->fast_write_slot=reinterpret_cast<uintptr_t>(&pippin_fastmem_write);}
+ static_assert(TLB_SIZE==4096);
+ layout->tlb_index_bits=tlb_size_mask==TLB_SIZE-1?12:0;
+#endif
+}
+
+// Private native-JIT oracle fixture. Used before guest execution only; the
+// existing current DTLB pointer/mask are restored before returning to the ROM.
+void sheep_mmu_test_page(uint8_t *ram,uint32_t va,uint16_t flags,bool miss)
+{
+ static std::array<TLBEntry,TLB_SIZE> fixture;
+ static TLBEntry *saved=nullptr;static uint32_t saved_mask;
+ if(!ram){pCurDTLB1=saved;tlb_size_mask=saved_mask;saved=nullptr;sheep_fast_select();return;}
+ if(!saved){saved=pCurDTLB1;saved_mask=tlb_size_mask;}
+ for(auto &entry:fixture)entry.tag=0xffffffff;
+ auto &entry=fixture[(va>>12)&(TLB_SIZE-1)];
+ entry.tag=miss?(va^0x1000):va;entry.flags=flags|0xa500;entry.lru_bits=0xa55a;
+ entry.host_va_offs_r=entry.host_va_offs_w=reinterpret_cast<intptr_t>(ram)-va;
+ pCurDTLB1=fixture.data();tlb_size_mask=TLB_SIZE-1;sheep_fast_select();
+}
+
+bool sheep_mmu_code_is_rom(const uint8_t *code,uint32_t pc)
+{
+ auto *entry=&pCurITLB1[(pc>>12)&tlb_size_mask];
+ if(entry->tag!=(pc&PPC_PAGE_MASK)||!(entry->flags&TLBFlags::PAGE_MEM)||reinterpret_cast<const uint8_t*>(entry->host_va_offs_r+pc)!=code)return false;
+ auto *region=mem_ctrl_instance->find_range(entry->phys_tag);
+ return region&&(region->type&RT_ROM)&&!(region->type&RT_RAM);
+}
+
+// Pippin's fixed ROM allocation also backs its instruction aliases. This
+// classification only gates native lookup; publishing a translation still
+// validates its current ITLB mapping and RT_ROM attributes independently.
+void sheep_mmu_rom_bounds(uintptr_t &begin,uintptr_t &end)
+{
+ begin=end=0;
+ auto *region=mem_ctrl_instance->find_rom_region();
+ if(region&&region->type==RT_ROM&&region->mem_ptr){
+  begin=reinterpret_cast<uintptr_t>(region->mem_ptr);
+  end=begin+(uint64_t(region->end)-region->start+1);
+ }
+}
+
+// Q203: called only on a settled canonical fetch, when the live token is invalid.
+extern std::vector<std::function<void()>> gCtxSyncCallbacks;
+bool sheep_mmu_rom_window_cold_refresh(uint32_t pc, const uint8_t *current_host) noexcept
+{
+    if (!sheep_rom_window_enabled) return false;
+    if (sheep_rom_window.valid_start_count) {
+        const uint32_t delta = pc - sheep_rom_window.guest_start;
+        if (sheep_rom_window.cpu_base == uintptr_t(&ppc_state) &&
+            !(pc & 3u) && delta < sheep_rom_window.valid_start_count &&
+            uintptr_t(pc) + sheep_rom_window.host_offset == uintptr_t(current_host))
+            return true;
+        sheep_mmu_rom_window_invalidate();
+    }
+    const uint32_t msr = ppc_state.msr;
+    if (is_601 || include_601 || ppc_state.spr[SPR::PVR] != PPC_VER::MPC603 ||
+        !(msr & MSR::IR) || (msr & MSR::LE) || exec_flags ||
+        gPendingIInvalidationSources || !gCtxSyncCallbacks.empty() ||
+        !mem_ctrl_instance || !current_host || !sheep_rom_bind_owner() ||
+        ((uintptr_t(current_host) | uintptr_t(pc)) & 3u) ||
+        tlb_size_mask != TLB_SIZE - 1)
+        return false;
+#if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
+    if (ppc_state.is_LE) return false;
+#endif
+    const bool user = (msr & MSR::PR) != 0;
+    const unsigned mode = 2u | unsigned(user);
+    if (CurITLBMode != mode ||
+        pCurITLB1 != (user ? itlb1_mode3.data() : itlb1_mode2.data()) ||
+        pCurITLB2 != (user ? itlb2_mode3.data() : itlb2_mode2.data()))
+        return false;
+
+    struct Range { uint64_t begin, size, physical; bool active; } ranges[4];
+    const unsigned access = user ? 1u : 2u;
+    int selected = -1;
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint32_t upper = ppc_state.spr[528 + 2 * i];
+        const uint32_t lower = ppc_state.spr[529 + 2 * i];
+        const uint32_t bl = (upper >> 2) & 0x7ffu;
+        if ((bl & (bl + 1u)) || (upper & 0x0001e000u) || (lower & 0x0001ff84u))
+            return false; // contiguous legal BL and no reserved raw BAT bits
+        const uint32_t mask = ~((bl << 17) | 0x1ffffu);
+        const uint32_t logical = upper & mask, physical = lower & mask;
+        const auto &derived = ibat_array[i]; // valid is meaningful only for601
+        if (derived.access != (upper & 3u) || derived.prot != (lower & 3u) ||
+            derived.hi_mask != mask || derived.phys_hi != physical ||
+            derived.bepi != logical ||
+            (upper & 0xfffe0000u) != logical ||
+            (lower & 0xfffe0000u) != physical)
+            return false;
+        ranges[i] = {logical, (uint64_t(bl) + 1u) << 17, physical,
+                     (upper & access) != 0};
+        if (ranges[i].active && (pc & mask) == logical) {
+            if (selected >= 0 || !(lower & 3u) || (lower & 8u)) return false;
+            selected = int(i);
+        }
+    }
+    if (selected < 0) return false;
+    const auto &chosen = ranges[selected];
+    const uint64_t logical_end = chosen.begin + chosen.size;
+    const uint64_t physical_end = chosen.physical + chosen.size;
+    if (logical_end > (uint64_t(1) << 32) || physical_end > (uint64_t(1) << 32))
+        return false;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (int(i) != selected && ranges[i].active &&
+            ranges[i].begin < logical_end &&
+            chosen.begin < ranges[i].begin + ranges[i].size)
+            return false; // refuse all overlap, including higher-priority denied BATs
+    }
+    const uint64_t physical_pc = chosen.physical + (uint64_t(pc) - chosen.begin);
+    const auto &entry = pCurITLB1[(pc >> PPC_PAGE_SIZE_BITS) & tlb_size_mask];
+    const uint16_t required = TLBFlags::PAGE_MEM | TLBFlags::TLBE_FROM_BAT;
+    if (entry.tag != (pc & PPC_PAGE_MASK) || (entry.flags & required) != required ||
+        (entry.flags & TLBFlags::PAGE_IO) ||
+        (entry.flags & TLBE_FROM_TRANSLATION) != TLBFlags::TLBE_FROM_BAT ||
+        uint64_t(entry.phys_tag) + (pc & (PPC_PAGE_SIZE - 1u)) != physical_pc ||
+        uintptr_t(entry.host_va_offs_r) + uintptr_t(pc) != uintptr_t(current_host))
+        return false;
+    auto *rom = mem_ctrl_instance->find_range(uint32_t(physical_pc));
+    if (!rom || rom->type != RT_ROM || !rom->mem_ptr ||
+        mem_ctrl_instance->find_rom_region() != rom)
+        return false;
+    const uint64_t rom_end = uint64_t(rom->end) + 1u;
+    const uint64_t first = chosen.physical > rom->start ? chosen.physical : rom->start;
+    const uint64_t last = physical_end < rom_end ? physical_end : rom_end;
+    if (last <= first || physical_pc < first || physical_pc >= last ||
+        ((first | last) & (PPC_PAGE_SIZE - 1u)))
+        return false;
+    const uint64_t size = last - first;
+    if (size > UINT32_MAX ||
+        !mem_ctrl_instance->instruction_rom_span(rom, uint32_t(first), size))
+        return false; // entire physical interval must have this unique ROM descriptor
+    const uintptr_t host = uintptr_t(rom->mem_ptr);
+    const uint64_t allocation = rom_end - uint64_t(rom->start);
+    if (allocation > uint64_t(UINTPTR_MAX - host)) return false;
+    const uintptr_t mapped = host + uintptr_t(first - uint64_t(rom->start));
+    const uint64_t begin = chosen.begin + first - chosen.physical;
+    if (mapped + uintptr_t(physical_pc - first) != uintptr_t(current_host))
+        return false;
+    if (size < 4 || begin > UINT32_MAX || begin + size > (uint64_t(1) << 32))
+        return false;
+    sheep_rom_window.guest_start = uint32_t(begin);
+    sheep_rom_window.host_offset = mapped - uintptr_t(begin);
+    sheep_rom_window.cpu_base = uintptr_t(&ppc_state);
+    sheep_rom_window.valid_start_count = uint32_t(size - 3u); // publish validity last
+    return true;
+}
+
+void sheep_mmu_test_data_pair(uint8_t *read,uint8_t *write,uint32_t page,uint16_t first_flags,uint16_t second_flags,bool second_valid)
+{
+ static std::array<TLBEntry,TLB_SIZE> fixture;static TLBEntry *saved=nullptr;static uint32_t mask;
+ if(!read){pCurDTLB1=saved;tlb_size_mask=mask;saved=nullptr;sheep_fast_select();return;}
+ if(!saved){saved=pCurDTLB1;mask=tlb_size_mask;}
+ for(auto &entry:fixture)entry.tag=0xffffffff;
+ for(unsigned i=0;i<2;i++){
+  auto &entry=fixture[((page>>12)+i)&(TLB_SIZE-1)];entry.tag=i&&!second_valid?0xffffffff:page+i*4096;
+  entry.flags=(i?second_flags:first_flags)|0x5a00;entry.lru_bits=0x5aa5;entry.host_va_offs_r=reinterpret_cast<intptr_t>(read)-page+i*16;entry.host_va_offs_w=reinterpret_cast<intptr_t>(write)-page+i*16;
+ }
+ pCurDTLB1=fixture.data();tlb_size_mask=TLB_SIZE-1;sheep_fast_select();
+}
+
+
+#include "sheep_jit_bridge.h"
+#if defined(__aarch64__) && !SUPPORTS_PPC_LITTLE_ENDIAN_MODE && !SUPPORTS_MEMORY_CTRL_ENDIAN_MODE && !defined(MMU_PROFILING) && !defined(TLB_PROFILING) && !defined(LOG_INSTRUCTIONS)
+static_assert(sizeof(TLBEntry)==32 && offsetof(TLBEntry,tag)==0 && offsetof(TLBEntry,host_va_offs_r)==8 && offsetof(TLBEntry,phys_tag)==24);
+const bool sheep_itlb_primary_enabled=true;
+#else
+const bool sheep_itlb_primary_enabled=false;
+#endif
+void sheep_mmu_itlb_selftest()
+{
+#if !SUPPORTS_PPC_LITTLE_ENDIAN_MODE && !SUPPORTS_MEMORY_CTRL_ENDIAN_MODE && !defined(MMU_PROFILING) && !defined(TLB_PROFILING) && !defined(LOG_INSTRUCTIONS)
+ static_assert(sizeof(TLBEntry)==32 && offsetof(TLBEntry,tag)==0 && offsetof(TLBEntry,host_va_offs_r)==8 && offsetof(TLBEntry,phys_tag)==24);
+ struct Restore { TLBEntry *table=pCurITLB1;uint32_t mask=tlb_size_mask;~Restore(){pCurITLB1=table;tlb_size_mask=mask;} } restore;
+ static std::array<TLBEntry,TLB_SIZE> tables[2];
+ std::array<uint8_t,4096> ram[2];unsigned passed=0;
+ for(unsigned which=0;which<2;which++)for(uint32_t mask:{3u,15u,4095u})
+ for(uint32_t page:{0u,0x1000u,0x68066000u,0xffc00000u,0xfffff000u})
+ for(unsigned offset:{0u,1u,2u,4u,4092u,4095u})for(unsigned flags:{0u,1u,2u,128u}){
+  pCurITLB1=tables[which].data();tlb_size_mask=mask;
+  auto &entry=pCurITLB1[(page>>12)&mask];entry.tag=page;entry.flags=flags;
+  entry.host_va_offs_r=reinterpret_cast<intptr_t>(ram[which].data())-int64_t(page);
+  entry.phys_tag=0x12345000u+which*0x10000u;
+  uint32_t va=page+offset,actual=0xdeadbeef,canonical=0xcafebabe;
+  auto *fast=sheep_itlb_primary_hit(va,&actual);auto *original=mmu_translate_imem(va,&canonical);
+  if(fast!=original||fast!=ram[which].data()+offset||actual!=canonical||sheep_translate_imem(va)!=original)
+   throw std::runtime_error("Primary ITLB hit differs from canonical translation");
+  passed++;
+  entry.tag^=4096;actual=0xdeadbeef;
+  if(sheep_itlb_primary_hit(va,&actual)!=nullptr||actual!=0xdeadbeef)
+   throw std::runtime_error("Primary ITLB miss changed translation output");
+  passed++;
+ }
+ fprintf(stderr,"ITLB PRIMARY SELFTEST %u table/mask/tag/physical/offset cases passed\n",passed);
+#endif
+}
+
+void sheep_mmu_split_read_selftest(){
+#if defined(__aarch64__) && __BYTE_ORDER__==__ORDER_LITTLE_ENDIAN__ && !SUPPORTS_PPC_LITTLE_ENDIAN_MODE && !SUPPORTS_MEMORY_CTRL_ENDIAN_MODE && !defined(MMU_PROFILING) && !defined(TLB_PROFILING) && !defined(LOG_INSTRUCTIONS)
+ struct Restore{TLBEntry *table=pCurDTLB1;uint32_t mask=tlb_size_mask;~Restore(){pCurDTLB1=table;tlb_size_mask=mask;sheep_fast_select();}}restore;
+ static std::array<TLBEntry,TLB_SIZE> tables[2];alignas(16) std::array<uint8_t,4096> ram[2];unsigned passed=0;
+ for(unsigned which=0;which<2;which++)for(unsigned i=0;i<4096;i++)ram[which][i]=uint8_t(i*37+which*13+11);
+ for(unsigned which=0;which<2;which++)for(uint32_t mask:{3u,15u,4095u})for(uint32_t page:{0u,0x1000u,0x68066000u,0xffc00000u,0xfffff000u})
+ for(unsigned offset:{0u,1u,2u,4u,8u,4088u,4092u,4095u})for(unsigned size:{1u,2u,4u,8u})for(unsigned flags:{0u,1u,0x61u,0xa561u}){
+  pCurDTLB1=tables[which].data();tlb_size_mask=mask;sheep_fast_select();auto &entry=pCurDTLB1[(page>>12)&mask];entry.tag=page;entry.flags=flags;entry.lru_bits=0xa55a;entry.host_va_offs_r=reinterpret_cast<intptr_t>(ram[which].data())-int64_t(page);
+  uint32_t va=page+offset;auto *host=sheep_primary_read_host(va,size);bool aligned=!(va&(size-1)),valid=aligned&&(flags&1);
+  if(bool(host)!=valid||(host&&host!=ram[which].data()+offset))throw std::runtime_error("Split MMU primary hit differs");
+  if(aligned){bool same=false;switch(size){
+   case 1:same=mmu_read_vmem<uint8_t>(0,va)==mmu_read_vmem_slow<uint8_t>(0,va);break;
+   case 2:same=mmu_read_vmem<uint16_t>(0,va)==mmu_read_vmem_slow<uint16_t>(0,va);break;
+   case 4:same=mmu_read_vmem<uint32_t>(0,va)==mmu_read_vmem_slow<uint32_t>(0,va);break;
+   case 8:same=mmu_read_vmem<uint64_t>(0,va)==mmu_read_vmem_slow<uint64_t>(0,va);break;
+  }if(!same)throw std::runtime_error("Split MMU read value differs from canonical slow body");}
+  passed++;entry.tag^=4096;if(sheep_primary_read_host(va,size))throw std::runtime_error("Split MMU accepted primary tag miss");passed++;
+ }
+ fprintf(stderr,"SPLIT MMU SELFTEST %u mapping/flags/size/alignment/value cases passed\n",passed);
+#endif
+}
+
+// Private fixtures bind a real primary slot, including its fastmem coherence
+// callbacks. The original slot and active table are restored before boot.
+static TLBEntry *fast_fixture_slot=nullptr,*fast_fixture_table=nullptr;
+static std::vector<std::pair<TLBEntry*,TLBEntry>> fast_fixture_secondary_saved;
+static TLBEntry fast_fixture_saved{};static uint32_t fast_fixture_mask=0;
+void sheep_mmu_test_fast_page(uint8_t *read,uint8_t *write,uint32_t va,uint16_t flags,bool miss,unsigned mode){
+ if(!read){
+  if(!fast_fixture_slot)throw std::runtime_error("Fastmem fixture restore without binding");
+  sheep_fast_invalidate(fast_fixture_slot);*fast_fixture_slot=fast_fixture_saved;sheep_fast_publish(fast_fixture_slot);
+  for(auto &item:fast_fixture_secondary_saved){sheep_fast_invalidate(item.first);*item.first=item.second;sheep_fast_publish(item.first);}fast_fixture_secondary_saved.clear();
+  pCurDTLB1=fast_fixture_table;tlb_size_mask=fast_fixture_mask;fast_fixture_slot=nullptr;fast_fixture_table=nullptr;sheep_fast_select();return;
+ }
+ if(fast_fixture_slot||mode>=3||(va&4095))throw std::runtime_error("Invalid fastmem fixture binding");
+ fast_fixture_table=pCurDTLB1;fast_fixture_mask=tlb_size_mask;pCurDTLB1=sheep_fast_owners[mode];tlb_size_mask=TLB_SIZE-1;
+ fast_fixture_slot=&pCurDTLB1[(va>>12)&(TLB_SIZE-1)];fast_fixture_saved=*fast_fixture_slot;sheep_fast_invalidate(fast_fixture_slot);
+ *fast_fixture_slot=TLBEntry{};fast_fixture_slot->tag=miss?(va^4096):va;fast_fixture_slot->flags=flags;
+ fast_fixture_slot->host_va_offs_r=reinterpret_cast<intptr_t>(read)-va;fast_fixture_slot->host_va_offs_w=reinterpret_cast<intptr_t>(write)-va;
+ sheep_fast_publish(fast_fixture_slot);sheep_fast_select();
+}
+void sheep_mmu_test_fast_transition(unsigned operation){
+ if(!fast_fixture_slot)throw std::runtime_error("Fastmem transition without binding");
+ if(operation==0){
+  auto fresh=*fast_fixture_slot;uintptr_t read=uintptr_t(fresh.host_va_offs_r)+fresh.tag,write=uintptr_t(fresh.host_va_offs_w)+fresh.tag;
+  fresh.tag+=TLB_SIZE*4096u;fresh.host_va_offs_r=read-fresh.tag;fresh.host_va_offs_w=write-fresh.tag;
+  promote_tlb_entry<TLBType::DTLB>(fast_fixture_slot,&fresh);
+ }else if(operation==1){
+  fast_fixture_slot->flags|=TLBFlags::TLBE_FROM_PAT;
+  std::vector<TLBEntry*> entries{fast_fixture_slot};tlb_invalidate_tracked_entries(entries,TLBFlags::TLBE_FROM_PAT);
+ }else if(operation>=4){
+  unsigned mode=unsigned(sheep_fast_owner(fast_fixture_slot));uint32_t old_va=fast_fixture_saved.tag;
+  if(operation==4){
+   old_va=fast_fixture_slot->tag;unsigned index=(old_va>>12)&(TLB_SIZE-1);
+   for(unsigned way=0;way<TLB2_WAYS;way++){auto *entry=&sheep_fast_secondary[mode][index*TLB2_WAYS+way];fast_fixture_secondary_saved.emplace_back(entry,*entry);sheep_fast_invalidate(entry);entry->tag=TLB_INVALID_TAG;entry->flags=0;}
+   auto *entry=fast_fixture_secondary_saved[0].first;*entry=*fast_fixture_slot;sheep_fast_publish(entry);
+  }else{
+   if(fast_fixture_secondary_saved.empty())throw std::runtime_error("Secondary fixture not seeded");auto *entry=fast_fixture_secondary_saved[0].first;
+   if(operation==5){auto fresh=*entry;uintptr_t r=uintptr_t(fresh.host_va_offs_r)+fresh.tag,w=uintptr_t(fresh.host_va_offs_w)+fresh.tag;sheep_fast_invalidate(entry);fresh.tag+=2*TLB_SIZE*4096u;fresh.host_va_offs_r=r-fresh.tag;fresh.host_va_offs_w=w-fresh.tag;*entry=fresh;sheep_fast_publish(entry);}
+   else{entry->flags|=TLBFlags::TLBE_FROM_PAT;std::vector<TLBEntry*> entries{entry};tlb_invalidate_tracked_entries(entries,TLBFlags::TLBE_FROM_PAT);}
+  }
+ }else{
+  fast_fixture_slot->flags=operation==2?0x41:0x61;sheep_fast_publish(fast_fixture_slot);
+ }
+}
+
+#include "rom-window-tests.inc"

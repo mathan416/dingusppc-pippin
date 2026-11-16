@@ -199,6 +199,7 @@ enum {
     EXEF_RFI            = 1 << 2, // RFI instruction executed
     EXEF_OPC_DECODER    = 1 << 3, // Opcode decoder has changed
     EXEF_SLEEP          = 1 << 4, // Processor is waiting in power-saving mode
+    EXEF_FETCH          = 1 << 5, // Instruction context changed; retranslate even within current page
 };
 
 enum CR_select : int32_t {

@@ -144,6 +144,8 @@ public:
     }
 
     void poll_events();
+    // CPU-owner pilot: SDL capture is main-only, signal delivery stays guest-owned.
+    void capture_host_events();
     void set_keyboard_locale(uint32_t keyboard_id);
     void post_keyboard_state_events();
     void post_cdrom_event(CdromImageEvent& event) {
@@ -196,6 +198,7 @@ public:
     }
 
 private:
+    void capture_keyboard_state(const std::function<void(const KeyboardEvent&)>& emit);
     static EventManager* event_manager;
     EventManager() {} // private constructor to implement a singleton
 

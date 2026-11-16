@@ -32,6 +32,7 @@ AspenCtrl::AspenCtrl() : MemCtrlBase() {
 
     // add MMIO region for the configuration and status registers
     this->add_mmio_region(0xF8000000, 0x800, this);
+    this->add_mmio_region(0x40000000, 0x80000, this);
 }
 
 int AspenCtrl::device_postinit() {
@@ -57,6 +58,7 @@ void AspenCtrl::insert_ram_dimm(int bank_num, uint32_t capacity) {
 }
 
 uint32_t AspenCtrl::read(uint32_t rgn_start, uint32_t offset, int size) {
+    if (rgn_start == 0x40000000) return save_flash.bus_read(offset, size);
     uint8_t     reg_num = (offset >> 2) & 0x1F;
     uint32_t    reg_val;
 
@@ -83,6 +85,7 @@ uint32_t AspenCtrl::read(uint32_t rgn_start, uint32_t offset, int size) {
 }
 
 void AspenCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, int size) {
+    if (rgn_start == 0x40000000) { save_flash.bus_write(offset, value, size); return; }
     uint8_t     reg_num = (offset >> 2) & 0x1F;
 
     switch(reg_num) {

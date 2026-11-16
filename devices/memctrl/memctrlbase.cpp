@@ -20,6 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
 #include <devices/memctrl/memctrlbase.h>
+#include <cpu/ppc/pippin_fastmem.h>
 #include <devices/common/mmiodevice.h>
 
 #include <algorithm>
@@ -29,17 +30,51 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <loguru.hpp>
 
 MemCtrlBase::~MemCtrlBase() {
+    notify_instruction_map_change(true);
     for (auto& entry : address_map) {
         if (entry)
             delete(entry);
     }
 
     for (auto& reg : mem_regions) {
-        if (reg)
+        if (reg && !pippin_fastmem_release(reg))
             delete (reg);
     }
     this->mem_regions.clear();
     this->address_map.clear();
+}
+
+bool MemCtrlBase::bind_instruction_map_observer(InstructionMapObserver observer) noexcept {
+    if (!observer || (instruction_map_observer && instruction_map_observer != observer))
+        return false;
+    instruction_map_observer = observer;
+    return true;
+}
+
+void MemCtrlBase::unbind_instruction_map_observer(InstructionMapObserver observer) noexcept {
+    if (instruction_map_observer == observer) instruction_map_observer = nullptr;
+}
+
+void MemCtrlBase::notify_instruction_map_change(bool destroying) noexcept {
+    if (instruction_map_observer) instruction_map_observer(this, destroying);
+    if (destroying) instruction_map_observer = nullptr;
+}
+
+bool MemCtrlBase::instruction_rom_span(const AddressMapEntry* region, uint32_t first,
+                                       uint64_t byte_count) const noexcept {
+    if (!region || region->type != RT_ROM || !region->mem_ptr || byte_count < 4 ||
+        uint64_t(first) + byte_count > (uint64_t(1) << 32) ||
+        first < region->start || uint64_t(first) + byte_count > uint64_t(region->end) + 1)
+        return false;
+    bool found = false;
+    for (const auto* entry : address_map) {
+        if (entry && uint64_t(entry->start) < uint64_t(first) + byte_count &&
+            uint64_t(first) <= entry->end) {
+            if (entry != region || found) return false;
+            found = true;
+        }
+    }
+    return found;
 }
 
 static std::string get_type_str(uint32_t type) {
@@ -199,8 +234,11 @@ AddressMapEntry* MemCtrlBase::add_mem_region(uint32_t start_addr, uint32_t size,
     if (!is_range_free(start_addr, size))
         return nullptr;
 
+    notify_instruction_map_change();
+
     if (!mem_ptr) {
-        mem_ptr = new uint8_t[size](); // allocate and clear to zero
+        mem_ptr = pippin_fastmem_alloc(size);
+        if (!mem_ptr) mem_ptr = new uint8_t[size](); // allocate and clear to zero
         this->mem_regions.push_back(mem_ptr);
     }
 
@@ -272,6 +310,7 @@ AddressMapEntry* MemCtrlBase::add_mem_mirror_common(uint32_t start_addr, uint32_
         return nullptr;
     }
 
+    notify_instruction_map_change();
     entry = new AddressMapEntry;
 
     uint32_t end   = start_addr + size - 1;
@@ -324,6 +363,7 @@ AddressMapEntry* MemCtrlBase::set_data(uint32_t load_addr, const uint8_t* data, 
     uint32_t load_offset = load_addr - ref_entry->start;
 
     cpy_size = std::min(ref_entry->end - ref_entry->start + 1, size);
+    notify_instruction_map_change();
     memcpy(ref_entry->mem_ptr + load_offset, data, cpy_size);
 
     return ref_entry;
@@ -338,6 +378,7 @@ AddressMapEntry* MemCtrlBase::add_mmio_region(uint32_t start_addr, uint32_t size
     if (!is_range_free(start_addr, size))
         return nullptr;
 
+    notify_instruction_map_change();
     entry = new AddressMapEntry;
 
     uint32_t end   = start_addr + size - 1;
@@ -364,6 +405,7 @@ AddressMapEntry* MemCtrlBase::add_mmio_region(uint32_t start_addr, uint32_t size
 
 bool MemCtrlBase::remove_mmio_region(uint32_t start_addr, uint32_t size, MMIODevice* dev_instance)
 {
+    notify_instruction_map_change();
     int found = 0;
 
     uint32_t end = start_addr + size - 1;
@@ -406,6 +448,7 @@ bool MemCtrlBase::remove_mmio_region(uint32_t start_addr, uint32_t size, MMIODev
 
 AddressMapEntry* MemCtrlBase::remove_region(AddressMapEntry* entry)
 {
+    notify_instruction_map_change();
     int found = 0;
 
     address_map.erase(std::remove_if(address_map.begin(), address_map.end(),

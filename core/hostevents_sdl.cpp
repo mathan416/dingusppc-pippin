@@ -19,12 +19,17 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include <main_cpu_owner.h>
+#include <stdexcept>
+#include <vector>
 #include <core/hostevents.h>
 #include <core/coresignal.h>
 #include <cpu/ppc/ppcemu.h>
 #include <devices/common/adb/adbkeyboard.h>
 #include <loguru.hpp>
 #include <SDL.h>
+#include <core/applejack_button_state.h>
+#include <core/pointer_button_map.h>
 
 EventManager* EventManager::event_manager;
 
@@ -51,21 +56,67 @@ void EventManager::set_keyboard_locale(uint32_t keyboard_id) {
 }
 
 void EventManager::poll_events() {
-    SDL_Event event;
+    if (pippin_cpu_owner::active()) {
+        if (!pippin_cpu_owner::is_worker_thread())
+            throw std::runtime_error("CPU-owner guest event poll on main thread");
+        pippin_cpu_owner::drain_guest();
+        this->_post_signal.emit();
+        return;
+    }
+    // The off path retains the original synchronous event delivery/cadence.
+    this->capture_host_events();
+    pippin_cpu_owner::publish_guest_time();
+}
 
-    while (SDL_PollEvent(&event)) {
+void EventManager::capture_host_events() {
+    if (pippin_cpu_owner::active() && !pippin_cpu_owner::is_main_thread())
+        throw std::runtime_error("CPU-owner SDL capture on worker thread");
+    SDL_Event event;
+    static AppleJackButtonState applejack_buttons;
+    static int pointer_x=0,pointer_y=0;
+    auto emit_pointer=[this](uint8_t state,int x,int y){
+        if(state==this->buttons_state)return;
+        this->buttons_state=state;MouseEvent me{};me.buttons_state=state;
+        me.xabs=x;me.yabs=y;me.flags=MOUSE_EVENT_BUTTON;
+        if(SDL_getenv("PIPPIN_INPUT_TRACE"))SDL_Log("PIPPIN_POINTER buttons=%u",unsigned(state));
+        pippin_cpu_owner::post_guest([this, me] { this->_mouse_signal.emit(me); });
+    };
+    auto emit_button=[this](uint32_t id,uint8_t button,bool down){
+        GamepadEvent ge{};ge.gamepad_id=id;ge.button=button;
+        ge.flags=down?GAMEPAD_EVENT_DOWN:GAMEPAD_EVENT_UP;
+        if(SDL_getenv("PIPPIN_INPUT_TRACE"))SDL_Log("PIPPIN_INPUT id=%u button=%u down=%d",unsigned(id),unsigned(button),int(down));
+        pippin_cpu_owner::post_guest([this, ge] { this->_gamepad_signal.emit(ge); });
+    };
+
+    // A host input storm must not prevent pending SDL control/frame jobs or
+    // worker shutdown from being serviced. Leave remaining events in SDL.
+    const bool owner_capture = pippin_cpu_owner::active();
+    unsigned batch_events = 0;
+    while ((!owner_capture || batch_events < 256) && SDL_PollEvent(&event)) {
+        ++batch_events;
         events_captured++;
 
         switch (event.type) {
         case SDL_QUIT:
-            power_off(po_quit);
+            applejack_buttons.release_all(emit_button);
+            emit_pointer(0,pointer_x,pointer_y);
+            pippin_cpu_owner::post_guest([] { power_off(po_quit); });
+            break;
+
+        case SDL_CONTROLLERDEVICEREMOVED:
+        case SDL_JOYDEVICEREMOVED:
+            applejack_buttons.release(event.jdevice.which,emit_button);
             break;
 
         case SDL_WINDOWEVENT: {
+                if(event.window.event==SDL_WINDOWEVENT_FOCUS_LOST){
+                    applejack_buttons.release_all(emit_button);
+                    emit_pointer(0,pointer_x,pointer_y);
+                }
                 WindowEvent we{};
                 we.sub_type  = event.window.event;
                 we.window_id = event.window.windowID;
-                this->_window_signal.emit(we);
+                pippin_cpu_owner::post_guest([this, we] { this->_window_signal.emit(we); });
             }
             break;
 
@@ -81,10 +132,10 @@ void EventManager::poll_events() {
                         WindowEvent we;
                         we.sub_type  = DPPC_WINDOWEVENT_MOUSE_GRAB_TOGGLE;
                         we.window_id = event.window.windowID;
-                        this->_window_signal.emit(we);
+                        pippin_cpu_owner::post_guest([this, we] { this->_window_signal.emit(we); });
                         we.sub_type  = DPPC_WINDOWEVENT_MOUSE_GRAB_CHANGED;
                         we.window_id = event.window.windowID;
-                        this->_window_signal.emit(we);
+                        pippin_cpu_owner::post_guest([this, we] { this->_window_signal.emit(we); });
                     }
                     return;
                 }
@@ -94,7 +145,7 @@ void EventManager::poll_events() {
                         WindowEvent we{};
                         we.sub_type  = DPPC_WINDOWEVENT_WINDOW_SCALE_QUALITY_TOGGLE;
                         we.window_id = event.window.windowID;
-                        this->_window_signal.emit(we);
+                        pippin_cpu_owner::post_guest([this, we] { this->_window_signal.emit(we); });
                     }
                     return;
                 }
@@ -104,7 +155,7 @@ void EventManager::poll_events() {
                         WindowEvent we{};
                         we.sub_type  = DPPC_WINDOWEVENT_WINDOW_FULL_SCREEN_TOGGLE;
                         we.window_id = event.window.windowID;
-                        this->_window_signal.emit(we);
+                        pippin_cpu_owner::post_guest([this, we] { this->_window_signal.emit(we); });
                     }
                     return;
                 }
@@ -114,7 +165,7 @@ void EventManager::poll_events() {
                         WindowEvent we{};
                         we.sub_type  = DPPC_WINDOWEVENT_WINDOW_FULL_SCREEN_TOGGLE_REVERSE;
                         we.window_id = event.window.windowID;
-                        this->_window_signal.emit(we);
+                        pippin_cpu_owner::post_guest([this, we] { this->_window_signal.emit(we); });
                     }
                     return;
                 }
@@ -124,7 +175,7 @@ void EventManager::poll_events() {
                         WindowEvent we{};
                         we.sub_type  = DPPC_WINDOWEVENT_WINDOW_BIGGER;
                         we.window_id = event.window.windowID;
-                        this->_window_signal.emit(we);
+                        pippin_cpu_owner::post_guest([this, we] { this->_window_signal.emit(we); });
                     }
                     return;
                 }
@@ -134,7 +185,7 @@ void EventManager::poll_events() {
                         WindowEvent we{};
                         we.sub_type  = DPPC_WINDOWEVENT_WINDOW_SMALLER;
                         we.window_id = event.window.windowID;
-                        this->_window_signal.emit(we);
+                        pippin_cpu_owner::post_guest([this, we] { this->_window_signal.emit(we); });
                     }
                     return;
                 }
@@ -143,8 +194,10 @@ void EventManager::poll_events() {
                     (event.key.keysym.mod & KMOD_ALL) == (KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT)
                 ) {
                     if (event.type == SDL_KEYUP) {
+                        pippin_cpu_owner::post_guest([] {
                         int icnt_counter_val = increment_icnt_factor();
                         LOG_F(INFO, "Incremented icnt_factor: %d", icnt_counter_val);
+                        });
                     }
                     return;
                 }
@@ -153,8 +206,10 @@ void EventManager::poll_events() {
                     (event.key.keysym.mod & KMOD_ALL) == (KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT)
                 ) {
                     if (event.type == SDL_KEYUP) {
+                        pippin_cpu_owner::post_guest([] {
                         int icnt_counter_val = decrement_icnt_factor();
                         LOG_F(INFO, "Decremented icnt_factor: %d", icnt_counter_val);
+                        });
                     }
                     return;
                 }
@@ -162,8 +217,10 @@ void EventManager::poll_events() {
                 // Control-Alt-R: g_realtime toggle
                 if (event.key.keysym.sym == SDLK_r && (event.key.keysym.mod & KMOD_ALL) == (KMOD_LCTRL | KMOD_LALT)) {
                     if (event.type == SDL_KEYUP) {
+                        pippin_cpu_owner::post_guest([] {
                         bool g_realtime_status = toggle_g_realtime();
                         LOG_F(INFO, "g_realtime: %s", g_realtime_status ? "enabled" : "disabled");
+                        });
                     }
                     return;
                 }
@@ -171,6 +228,7 @@ void EventManager::poll_events() {
                 // Control-L: log toggle
                 if (event.key.keysym.sym == SDLK_l && (event.key.keysym.mod & KMOD_ALL) == KMOD_LCTRL) {
                     if (event.type == SDL_KEYUP) {
+                        pippin_cpu_owner::post_guest([] {
                         loguru::Verbosity new_verbosity = loguru::g_stderr_verbosity;
                         if (new_verbosity < loguru::Verbosity_INFO)
                             new_verbosity = loguru::Verbosity_INFO;
@@ -181,13 +239,14 @@ void EventManager::poll_events() {
                         loguru::g_stderr_verbosity = loguru::Verbosity_INFO;
                         LOG_F(INFO, "g_stderr_verbosity: %d", new_verbosity);
                         loguru::g_stderr_verbosity = new_verbosity;
+                        });
                     }
                     return;
                 }
                 // Control-D: debugger
                 if (event.key.keysym.sym == SDLK_d && (event.key.keysym.mod & KMOD_ALL) == KMOD_LCTRL) {
                     if (event.type == SDL_KEYUP) {
-                        power_off(po_enter_debugger);
+                        pippin_cpu_owner::post_guest([] { power_off(po_enter_debugger); });
                     }
                     return;
                 }
@@ -204,9 +263,9 @@ void EventManager::poll_events() {
                         key_ups++;
                     }
 
-                    this->_keyboard_signal.emit(ke);
+                    pippin_cpu_owner::post_guest([this, ke] { this->_keyboard_signal.emit(ke); });
                     ke.key = AdbKey_Delete;
-                    this->_keyboard_signal.emit(ke);
+                    pippin_cpu_owner::post_guest([this, ke] { this->_keyboard_signal.emit(ke); });
                     return;
                 }
                 int key_code = get_sdl_event_key_code(event.key, this->kbd_locale);
@@ -225,7 +284,7 @@ void EventManager::poll_events() {
                         ke.flags = event.key.keysym.mod & KMOD_CAPS ?
                             KEYBOARD_EVENT_DOWN : KEYBOARD_EVENT_UP;
                     }
-                    this->_keyboard_signal.emit(ke);
+                    pippin_cpu_owner::post_guest([this, ke] { this->_keyboard_signal.emit(ke); });
                 } else {
                     LOG_F(WARNING, "Unknown key %x pressed", event.key.keysym.sym);
                 }
@@ -233,98 +292,42 @@ void EventManager::poll_events() {
             break;
 
         case SDL_MOUSEMOTION: {
+                pointer_x=event.motion.x;pointer_y=event.motion.y;
                 MouseEvent me{};
                 me.xrel  = event.motion.xrel;
                 me.yrel  = event.motion.yrel;
                 me.xabs  = event.motion.x;
                 me.yabs  = event.motion.y;
                 me.flags = MOUSE_EVENT_MOTION;
-                this->_mouse_signal.emit(me);
+                pippin_cpu_owner::post_guest([this, me] { this->_mouse_signal.emit(me); });
             }
             break;
 
-        case SDL_MOUSEBUTTONDOWN: {
-                MouseEvent me{};
-                Uint8 adb_button;
-                switch (event.button.button) {
-                    case SDL_BUTTON_LEFT   : adb_button = 0; break;
-                    case SDL_BUTTON_MIDDLE : adb_button = 2; break;
-                    case SDL_BUTTON_RIGHT  : adb_button = 1; break;
-                    default                : adb_button = event.button.button - 1;
-                }
-                me.buttons_state = (this->buttons_state |= (1 << adb_button));
-                me.xabs  = event.button.x;
-                me.yabs  = event.button.y;
-                me.flags = MOUSE_EVENT_BUTTON;
-                this->_mouse_signal.emit(me);
-            }
-            break;
-
+        case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP: {
-                MouseEvent me{};
-                Uint8 adb_button;
-                switch (event.button.button) {
-                    case SDL_BUTTON_LEFT   : adb_button = 0; break;
-                    case SDL_BUTTON_MIDDLE : adb_button = 2; break;
-                    case SDL_BUTTON_RIGHT  : adb_button = 1; break;
-                    default                : adb_button = event.button.button - 1;
-                }
-                me.buttons_state = (this->buttons_state &= ~(1 << adb_button));
-                me.xabs  = event.button.x;
-                me.yabs  = event.button.y;
-                me.flags = MOUSE_EVENT_BUTTON;
-                this->_mouse_signal.emit(me);
+                uint8_t mask=0;
+                if(!pippin_pointer_button(event.button.button,mask))break;
+                pointer_x=event.button.x;pointer_y=event.button.y;
+                uint8_t next=event.type==SDL_MOUSEBUTTONDOWN?
+                    this->buttons_state|mask:this->buttons_state&~mask;
+                emit_pointer(next,pointer_x,pointer_y);
             }
             break;
 
-        case SDL_CONTROLLERBUTTONDOWN: {
-                GamepadEvent ge{};
-                switch (event.cbutton.button) {
-                    case SDL_CONTROLLER_BUTTON_BACK:          ge.button = GamepadButton::FrontLeft;    break;
-                    case SDL_CONTROLLER_BUTTON_GUIDE:         ge.button = GamepadButton::FrontMiddle;  break;
-                    case SDL_CONTROLLER_BUTTON_START:         ge.button = GamepadButton::FrontRight;   break;
-                    case SDL_CONTROLLER_BUTTON_Y:             ge.button = GamepadButton::Blue;         break;
-                    case SDL_CONTROLLER_BUTTON_X:             ge.button = GamepadButton::Yellow;       break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_UP:       ge.button = GamepadButton::Up;           break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_LEFT:     ge.button = GamepadButton::Left;         break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:    ge.button = GamepadButton::Right;        break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_DOWN:     ge.button = GamepadButton::Down;         break;
-                    case SDL_CONTROLLER_BUTTON_A:             ge.button = GamepadButton::Red;          break;
-                    case SDL_CONTROLLER_BUTTON_B:             ge.button = GamepadButton::Green;        break;
-                    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: ge.button = GamepadButton::RightTrigger; break;
-                    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  ge.button = GamepadButton::LeftTrigger;  break;
-                }
-                ge.gamepad_id = event.cbutton.which;
-                ge.flags = GAMEPAD_EVENT_DOWN;
-                this->_gamepad_signal.emit(ge);
-            }
+        case SDL_CONTROLLERBUTTONDOWN:
+            applejack_buttons.change(event.cbutton.which,event.cbutton.button,true,emit_button);
             break;
 
-        case SDL_CONTROLLERBUTTONUP: {
-                GamepadEvent ge{};
-                switch (event.cbutton.button) {
-                    case SDL_CONTROLLER_BUTTON_BACK:          ge.button = GamepadButton::FrontLeft;    break;
-                    case SDL_CONTROLLER_BUTTON_GUIDE:         ge.button = GamepadButton::FrontMiddle;  break;
-                    case SDL_CONTROLLER_BUTTON_START:         ge.button = GamepadButton::FrontRight;   break;
-                    case SDL_CONTROLLER_BUTTON_Y:             ge.button = GamepadButton::Blue;         break;
-                    case SDL_CONTROLLER_BUTTON_X:             ge.button = GamepadButton::Yellow;       break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_UP:       ge.button = GamepadButton::Up;           break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_LEFT:     ge.button = GamepadButton::Left;         break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:    ge.button = GamepadButton::Right;        break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_DOWN:     ge.button = GamepadButton::Down;         break;
-                    case SDL_CONTROLLER_BUTTON_A:             ge.button = GamepadButton::Red;          break;
-                    case SDL_CONTROLLER_BUTTON_B:             ge.button = GamepadButton::Green;        break;
-                    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: ge.button = GamepadButton::RightTrigger; break;
-                    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  ge.button = GamepadButton::LeftTrigger;  break;
-                }
-                ge.gamepad_id = event.cbutton.which;
-                ge.flags = GAMEPAD_EVENT_UP;
-                this->_gamepad_signal.emit(ge);
-            }
+        case SDL_CONTROLLERBUTTONUP:
+            applejack_buttons.change(event.cbutton.which,event.cbutton.button,false,emit_button);
             break;
 
         case SDL_DROPFILE: {
-                const char* path = event.drop.file;
+                // SDL owns the original pointer; copy it before queuing guest work.
+                std::string image_path = event.drop.file;
+                SDL_free(event.drop.file);
+                pippin_cpu_owner::post_guest([this, image_path] {
+                const char* path = image_path.c_str();
                 // TODO: Distinguish CD-ROM and floppy images once dynamic
                 // floppy insertion is supported.
                 CdromImageEvent cdrom_event{};
@@ -348,7 +351,7 @@ void EventManager::poll_events() {
                     break;
                 }
 
-                SDL_free(event.drop.file);
+                });
             }
             break;
 
@@ -358,10 +361,30 @@ void EventManager::poll_events() {
     }
 
     // perform post-processing
-    this->_post_signal.emit();
+    if (!pippin_cpu_owner::active()) this->_post_signal.emit();
 }
 
 void EventManager::post_keyboard_state_events() {
+    if (pippin_cpu_owner::active()) {
+        if (!pippin_cpu_owner::is_worker_thread())
+            throw std::runtime_error("CPU-owner keyboard guest delivery on main");
+        std::vector<KeyboardEvent> snapshot;
+        pippin_cpu_owner::call_main([this, &snapshot] {
+            this->capture_keyboard_state([&snapshot](const KeyboardEvent& event) {
+                snapshot.push_back(event);
+            });
+        });
+        for (const auto& event : snapshot) this->_keyboard_signal.emit(event);
+        return;
+    }
+    this->capture_keyboard_state([this](const KeyboardEvent& event) {
+        this->_keyboard_signal.emit(event);
+    });
+}
+
+void EventManager::capture_keyboard_state(const std::function<void(const KeyboardEvent&)>& emit) {
+    if (pippin_cpu_owner::active() && !pippin_cpu_owner::is_main_thread())
+        throw std::runtime_error("CPU-owner keyboard SDL snapshot on worker");
     int count;
     int numkeys;
     const Uint8 *states = SDL_GetKeyboardState(&numkeys);
@@ -404,7 +427,7 @@ void EventManager::post_keyboard_state_events() {
         count++;
         ke.key = swap_command_option(mod->adbkey);
         ke.flags = KEYBOARD_EVENT_DOWN;
-        this->_keyboard_signal.emit(ke);
+        emit(ke);
     }
     if (!count)
         LOG_F(INFO, "        (none)");
@@ -434,7 +457,7 @@ void EventManager::post_keyboard_state_events() {
         if (key_code != -1) {
             ke.key = key_code;
             ke.flags = KEYBOARD_EVENT_DOWN;
-            this->_keyboard_signal.emit(ke);
+            emit(ke);
         } else {
             LOG_F(WARNING, "        Unknown key %x pressed", keyevent.keysym.sym);
         }

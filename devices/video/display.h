@@ -26,7 +26,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <core/hostevents.h>
 #include <core/memaccess.h>
+#include <devices/video/indexed_snapshot.h>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 
@@ -73,6 +75,10 @@ public:
                 bool draw_hw_cursor, int cursor_x, int cursor_y,
                 bool fb_known_to_be_changed);
 
+    bool raw_frames_enabled() const;
+    void update_raw(std::unique_ptr<const pippin_indexed::Snapshot> snapshot,
+                    bool draw_hw_cursor, int cursor_x, int cursor_y);
+
     // Called in cases where the framebuffer contents have not changed, so a
     // normal update() call is not happening. Allows implementations that need
     // to do per-frame bookkeeping to still do that.
@@ -85,6 +91,14 @@ public:
     void toggle_mouse_grab();
     void update_mouse_grab(bool will_be_grabbed);
 private:
+    void update_pooled(std::function<void(uint8_t*, int)> convert_fb_cb,
+                       std::function<void(uint8_t*, int)> cursor_ovl_cb,
+                       bool draw_hw_cursor, int cursor_x, int cursor_y);
+    void present_pending_pooled_frame(uint64_t generation);
+    unsigned handle_events_main(const WindowEvent& wnd_event);
+    void apply_guest_dirty(unsigned dirty);
+    void present_pending_frame(uint64_t generation);
+    void render_frame(bool draw_hw_cursor, int cursor_x, int cursor_y);
     class Impl; // Holds private fields
     std::unique_ptr<Impl> impl;
     VideoCtrlBase* video_ctrl = nullptr;

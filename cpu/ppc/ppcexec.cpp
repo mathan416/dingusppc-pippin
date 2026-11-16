@@ -24,6 +24,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "ppcemu.h"
 #include "ppcmmu.h"
 #include "ppcdisasm.h"
+#include "sheep_jit_bridge.h"
+#include "pippin_fastmem.h"
 
 #include <algorithm>
 #include <chrono>
@@ -236,7 +238,51 @@ static PPCOpcode OpcodeGrabber[64 * 2048];
     everything else is the same.*/
 static PPCOpcode OpcodeGrabberNoFPU[64 * 2048];
 
+// Private JIT fallback dispatch: operand bits need not index a 1 MiB table.
+// Only primary groups proven identical for every discarded bit are compacted.
+alignas(64) static PPCOpcode SheepCompactHandlers[2][64 * 4];
+static uint64_t sheep_compact_primary_mask = 0;
+static PPCOpcode *sheep_compact_decoder(PPCOpcode *decoder) {
+    if (decoder == OpcodeGrabber) return SheepCompactHandlers[0];
+    if (decoder == OpcodeGrabberNoFPU) return SheepCompactHandlers[1];
+    return nullptr;
+}
+static void sheep_build_compact_decoders() {
+    sheep_compact_primary_mask = 0;
+    PPCOpcode *tables[] = {OpcodeGrabber, OpcodeGrabberNoFPU};
+    for (unsigned primary = 0; primary < 64; ++primary) {
+        bool identical = true;
+        for (unsigned mode = 0; mode < 2; ++mode) {
+            auto *table = tables[mode];
+            for (unsigned modifier = 0; modifier < 4; ++modifier)
+                SheepCompactHandlers[mode][primary * 4 + modifier] = table[primary * 2048 + modifier];
+            for (unsigned modifier = 4; modifier < 2048; ++modifier)
+                identical &= table[primary * 2048 + modifier] == table[primary * 2048 + (modifier & 3)];
+        }
+        if (identical) sheep_compact_primary_mask |= uint64_t(1) << primary;
+    }
+}
+void sheep_compact_dispatch_selftest() {
+    PPCOpcode *tables[] = {OpcodeGrabber, OpcodeGrabberNoFPU};
+    unsigned checked = 0;
+    for (unsigned mode = 0; mode < 2; ++mode)
+        for (unsigned primary = 0; primary < 64; ++primary)
+            for (unsigned modifier = 0; modifier < 2048; ++modifier) {
+                auto actual = (sheep_compact_primary_mask & (uint64_t(1) << primary))
+                    ? SheepCompactHandlers[mode][primary * 4 + (modifier & 3)]
+                    : tables[mode][primary * 2048 + modifier];
+                if (actual != tables[mode][primary * 2048 + modifier])
+                    throw std::runtime_error("Compact decoder differs from canonical opcode table");
+                ++checked;
+            }
+    fprintf(stderr, "COMPACT DISPATCH SELFTEST %u FPU/disabled handler identities passed; mask=%016llx\n",
+            checked, (unsigned long long)sheep_compact_primary_mask);
+}
+
+
 void ppc_msr_did_change(uint32_t old_msr_val, uint32_t new_msr_val, bool set_next_instruction_address) {
+    if ((old_msr_val ^ new_msr_val) & (MSR::IR | MSR::PR | MSR::LE))
+        sheep_mmu_rom_window_invalidate();
     ppc_state.msr = new_msr_val;
     if ((old_msr_val ^ new_msr_val) & MSR::FP) {
         bool newFP = (new_msr_val & MSR::FP) != 0;
@@ -256,6 +302,7 @@ void ppc_msr_did_change(uint32_t old_msr_val, uint32_t new_msr_val, bool set_nex
 }
 
 void ppc_change_endian(bool newLE) {
+    sheep_mmu_rom_window_invalidate();
 #if SUPPORTS_PPC_LITTLE_ENDIAN_MODE
     if (ppc_state.is_LE != newLE) {
         LOG_F(INFO, "changed endian to %s", newLE ? "LE" : "BE");
@@ -343,6 +390,24 @@ void ppc_main_opcode(PPCOpcode *opcodeGrabber, uint32_t opcode)
 #endif
 }
 
+bool sheep_encode_rom_handler(uint32_t opcode,uint32_t &description){
+ unsigned index=(opcode>>15&0x1f800)|(opcode&0x7ff);
+ auto enabled=OpcodeGrabber[index],disabled=OpcodeGrabberNoFPU[index];
+ bool floating=enabled!=disabled;
+ if(floating&&disabled!=ppc_fpu_off)return false;
+ uintptr_t base=reinterpret_cast<uintptr_t>(&ppc_illegalop),target=reinterpret_cast<uintptr_t>(enabled);
+ if((base|target)&3)return false;
+ int64_t words=(int64_t(target)-int64_t(base))/4;
+ if(words<-(int64_t(1)<<28)||words>=(int64_t(1)<<28))return false;
+ description=((uint32_t(words)&0x1fffffffu)<<2)|(floating?0x80000000u:0u);
+ sheep_rom_disabled_fpu_handler=ppc_fpu_off;
+ return true;
+}
+bool sheep_rom_handler_matches(uint32_t opcode,uint64_t word){
+ unsigned index=(opcode>>15&0x1f800)|(opcode&0x7ff);
+ return sheep_rom_cached_handler(word,false)==OpcodeGrabber[index]&&sheep_rom_cached_handler(word,true)==OpcodeGrabberNoFPU[index];
+}
+
 static long long cpu_now_ns() {
 #ifdef __APPLE__
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -382,6 +447,7 @@ static uint64_t process_events()
 {
     exec_timer = false;
     uint64_t next_ns = TimerManager::get_instance()->process_timers();
+    pippin_fastmem_poll();
     if (g_realtime) {
         uint64_t time_now = get_virt_time_ns();
         uint64_t delay_ns;
@@ -453,15 +519,951 @@ typedef enum {
 } ppc_exec_type_t;
 
 // inner interpreter loop
-template <ppc_exec_type_t exec_type, endian_switch endian>
+// Branches that miss the JIT still dominated interpreted CPU samples. Keep
+// canonical PowerPC semantics but bypass the table lookup and indirect call.
+[[gnu::always_inline]] static inline bool sheep_execute_simple_branch(uint32_t opcode){
+ unsigned primary=opcode>>26;
+ if(primary==18){
+  int32_t offset=int32_t((opcode&~3u)<<6)>>6;
+  ppc_next_instruction_address=(opcode&2)?uint32_t(offset):uint32_t(ppc_state.pc+offset);
+  if(opcode&1)ppc_state.spr[SPR::LR]=ppc_state.pc+4;
+  exec_flags=EXEF_BRANCH;return true;
+ }
+ if(primary==16){
+  unsigned bo=(opcode>>21)&31,bi=(opcode>>16)&31;
+  if(!(bo&4))--ppc_state.spr[SPR::CTR];
+  bool ctr_ok=(bo&4)||((ppc_state.spr[SPR::CTR]!=0)==!(bo&2));
+  bool cnd_ok=(bo&16)||(!(ppc_state.cr&(0x80000000u>>bi))==!(bo&8));
+  if(ctr_ok&&cnd_ok){
+   int32_t offset=int16_t(opcode&~3u);
+   ppc_next_instruction_address=(opcode&2)?uint32_t(offset):uint32_t(ppc_state.pc+offset);
+   exec_flags=EXEF_BRANCH;
+  }
+  if(opcode&1)ppc_state.spr[SPR::LR]=ppc_state.pc+4;
+  return true;
+ }
+ return false;
+}
+
+void sheep_branch_dispatch_selftest(){
+ const auto saved=ppc_state;const auto flags=exec_flags;const auto next=ppc_next_instruction_address;
+ unsigned passed=0;
+ // Both canonical decoders must agree for every opcode modifier before using
+ // the primary-opcode specialization on RAM or decoded immutable ROM.
+ PPCOpcode *tables[]={OpcodeGrabber,OpcodeGrabberNoFPU};
+ PPCOpcode b[]={ppc_b<LK0,AA0>,ppc_b<LK1,AA0>,ppc_b<LK0,AA1>,ppc_b<LK1,AA1>};
+ PPCOpcode bc[]={ppc_bc<LK0,AA0>,ppc_bc<LK1,AA0>,ppc_bc<LK0,AA1>,ppc_bc<LK1,AA1>};
+ for(auto table:tables)for(unsigned modifier=0;modifier<2048;modifier++){
+  if(table[18*2048+modifier]!=b[modifier&3]||table[16*2048+modifier]!=bc[modifier&3])
+   throw std::runtime_error("Simple branch decoder specialization is not canonical");
+ }
+ auto compare=[&](uint32_t op){
+  const auto initial=ppc_state;exec_flags=EXEF_OPC_DECODER;ppc_next_instruction_address=0x31415920;
+  if(!sheep_execute_simple_branch(op))throw std::runtime_error("Simple branch rejected fixture");
+  const auto result=ppc_state;const auto actual_flags=exec_flags,actual_next=ppc_next_instruction_address;
+  ppc_state=initial;exec_flags=EXEF_OPC_DECODER;ppc_next_instruction_address=0x31415920;
+  ppc_main_opcode(OpcodeGrabber,op);
+  if(std::memcmp(&ppc_state,&result,sizeof(result))||actual_flags!=exec_flags||actual_next!=ppc_next_instruction_address)
+   throw std::runtime_error("Simple branch state/target/flags differs from canonical interpreter");
+  passed++;
+ };
+ for(uint32_t pc:{0u,0xfffffffcu})for(unsigned aa_lk=0;aa_lk<4;aa_lk++){
+  for(uint32_t offset:{0u,4u,0x01fffffcu,0x02000000u,0x03fffffcu}){
+   ppc_state=saved;ppc_state.pc=pc;compare((18u<<26)|offset|aa_lk);
+  }
+  for(unsigned bo=0;bo<32;bo++)for(unsigned bi=0;bi<32;bi++)for(unsigned bit=0;bit<2;bit++)
+   for(uint32_t ctr:{0u,1u,2u,0xffffffffu})for(uint32_t offset:{0u,0x7ffcu,0xfffcu}){
+    ppc_state=saved;ppc_state.pc=pc;ppc_state.cr=bit?(0x80000000u>>bi):0;
+    ppc_state.spr[SPR::CTR]=ctr;compare((16u<<26)|(bo<<21)|(bi<<16)|offset|aa_lk);
+   }
+ }
+ ppc_state=saved;exec_flags=flags;ppc_next_instruction_address=next;
+ fprintf(stderr,"SIMPLE BRANCH SELFTEST %u canonical CPU/CR/CTR/LR/AA/LK/wrap/target/flags cases passed; 8192 decoder identities checked\n",passed);
+}
+
+#include <cstddef>
+// X29 is the actual global instruction-clock address in every private loop
+// context. Nearby scheduler fields use assembler-resolved displacements rather
+// than loading their pointers from context on every instruction. Keep every
+// original volatile timer, power, flags and deadline check in its old place.
+// Separate immutable-source planning from the current execution deadline.
+// The caller has already translated this source page; never inspect a future
+// page or create/fill a mapping while deciding how much ROM may be decoded.
+unsigned sheep_rom_plan_bound(const uint8_t *code,uint32_t pc,uint32_t page_end){
+ const uintptr_t host=reinterpret_cast<uintptr_t>(code);
+ const uintptr_t begin=sheep_rom_host_begin,end=sheep_rom_host_end;
+ if(!sheep_rom_only||!begin||end<=begin||host<begin||host>=end||((host|pc)&3))return 0;
+ if(page_end<pc||((page_end^pc)&0xfffff000u))return 0;
+ const uint64_t page_words=(uint64_t(page_end)-pc+1)/4;
+ const uintptr_t rom_words=(end-host)/4;
+ return unsigned(std::min<uint64_t>(sheep_native_max_ops,std::min<uint64_t>(page_words,rom_words)));
+}
+void sheep_rom_plan_bound_selftest(){
+ const uintptr_t saved_begin=sheep_rom_host_begin,saved_end=sheep_rom_host_end;const bool saved_only=sheep_rom_only;
+ unsigned passed=0;
+ // Pure integer-address oracle: no guest or artificial source bytes are read.
+ for(unsigned mode=0;mode<4;mode++)for(uintptr_t offset:{uintptr_t(0),uintptr_t(1),uintptr_t(4),uintptr_t(124),uintptr_t(4092),uintptr_t(4096),uintptr_t(8188),uintptr_t(8192)})
+ for(uint32_t pc:{0u,1u,4u,0xff0u,0xffcu,0x1000u,0xfffffff0u,0xfffffffcu})for(unsigned tail=0;tail<4;tail++){
+  sheep_rom_only=mode!=0;sheep_rom_host_begin=0x10000000u;
+  sheep_rom_host_end=mode==1?sheep_rom_host_begin:mode==2?sheep_rom_host_begin+8190:sheep_rom_host_begin+8192;
+  const uintptr_t host=sheep_rom_host_begin+offset;
+  const uint32_t page_end=tail==0?(pc|4095u):tail==1?pc:tail==2?pc+3u:(pc^4096u)|4095u;
+  unsigned expected=0;
+  if(sheep_rom_only&&sheep_rom_host_end>sheep_rom_host_begin&&host>=sheep_rom_host_begin&&host<sheep_rom_host_end&&!(host&3)&&!(pc&3)&&page_end>=pc&&(page_end>>12)==(pc>>12)){
+   for(unsigned i=0;i<32;i++){
+    const uint64_t last_guest=uint64_t(pc)+uint64_t(i)*4+3;
+    const uint64_t last_host=uint64_t(host)+uint64_t(i)*4+3;
+    if(last_guest>page_end||last_host>=sheep_rom_host_end)break;
+    expected++;
+   }
+  }
+  if(sheep_rom_plan_bound(reinterpret_cast<const uint8_t*>(host),pc,page_end)!=expected)throw std::runtime_error("ROM decode bound differs from per-word address oracle");
+  passed++;
+ }
+ sheep_rom_host_begin=saved_begin;sheep_rom_host_end=saved_end;sheep_rom_only=saved_only;
+ fprintf(stderr,"ROM PLAN BOUNDS SELFTEST %u mode/page/wrap/host/alignment/partial-word cases passed\n",passed);
+}
+static bool sheep_direct_poll_layout(){
+ const uintptr_t clock=reinterpret_cast<uintptr_t>(&g_icycles);
+ for(uintptr_t field:{reinterpret_cast<uintptr_t>(&exec_timer),reinterpret_cast<uintptr_t>(&exec_flags),reinterpret_cast<uintptr_t>(&power_on),reinterpret_cast<uintptr_t>(&ppc_next_instruction_address)}){
+  const int64_t offset=int64_t(field)-int64_t(clock);if(offset < -256||offset > 255)return false;
+ }
+ return true;
+}
+// Experimental steady-state ROM loop. Every scalar instruction retains the
+// canonical handler. Native blocks use the existing bounded, guarded ABI.
+// Return 1 leaves exactly one final post-instruction event/accounting step for
+// ppc_exec; return 0 leaves an unexecuted cold opcode for the original path.
+uint64_t sheep_steady_spans=0,sheep_steady_instructions=0;
+// The original fields retain their offsets; a live ROM-window pointer is
+// appended to the private ABI. Legacy aggregate fixtures leave it null.
+struct SheepLoopContext {
+ uintptr_t cpu,words,counters,native_base,illegal,fpu_disabled,timer,clock,flags,next;
+ uint64_t max_cycles;uint8_t *host;
+ uint32_t page_start,page_end,pc_offset,cr_offset,lr_offset,disabled;
+ uintptr_t reject,memory_bail,power;uint32_t retired,native_used;uintptr_t itlb,mask,rom_begin,rom_end,opcodes;uint32_t source_ram,allow_ram;
+ const SheepROMWindow *window;
+};
+static_assert(offsetof(SheepLoopContext,max_cycles)==80&&offsetof(SheepLoopContext,reject)==120&&offsetof(SheepLoopContext,window)==200&&sizeof(SheepLoopContext)==208,"ARM64 CPU-loop ABI");
+extern "C" unsigned sheep_cpu_loop_a64(SheepLoopContext*);
+extern "C" void sheep_cpu_loop_reject(const uint8_t *code,uint32_t pc){sheep_reject_set(code,pc,32);}
+#if defined(__aarch64__)
+static_assert(offsetof(SetPRS,pc)==256,"Specialized CPU loop requires the validated SetPRS layout");
+asm(R"(
+.text
+.p2align 4
+.global sheep_cpu_loop_a64
+.type sheep_cpu_loop_a64,%function
+sheep_cpu_loop_a64:
+.cfi_startproc
+ stp x19,x20,[sp,#-96]!
+.cfi_def_cfa_offset 96
+.cfi_offset 19,-96
+.cfi_offset 20,-88
+ stp x21,x22,[sp,#16]
+.cfi_offset 21,-80
+.cfi_offset 22,-72
+ stp x23,x24,[sp,#32]
+.cfi_offset 23,-64
+.cfi_offset 24,-56
+ stp x25,x26,[sp,#48]
+.cfi_offset 25,-48
+.cfi_offset 26,-40
+ stp x27,x28,[sp,#64]
+.cfi_offset 27,-32
+.cfi_offset 28,-24
+ stp x29,x30,[sp,#80]
+.cfi_offset 29,-16
+.cfi_offset 30,-8
+ mov x28,x0
+ ldr x19,[x28]
+ ldr x20,[x28,#88]
+ ldr w9,[x28,#192]
+ orr x20,x20,x9
+ ldr x21,[x28,#8]
+ ldr x23,[x28,#80]
+ ldr x29,[x28,#56]
+ ldr x22,[x29]
+ // X22 is authoritative between observers. Publish before every external call
+ // (including native fault entry), and on every return or trap. Polls below
+ // consume X22 directly; canonical handlers may change memory, so their reload
+ // remains mandatory. The asynchronous owned main thread uses its atomic time
+ // snapshot; raw diagnostic clock reads between observers remain non-atomic.
+ ldr w24,[x19,#256]
+ mov w27,#0
+ // Every published window belongs to the same global CPU object. Cache only
+ // that immutable identity; start/count/host offset stay live at every probe.
+ ldr x9,[x28,#200]
+ cbz x9,.Lsl_window_identity_done
+ ldr x9,[x9,#16]
+ cmp x19,x9
+ cset x27,eq
+ lsl x27,x27,#32
+.Lsl_window_identity_done:
+ // Only CPU callbacks can change instruction flags. Start the leaf fast loop
+ // with no pending action; the normal C++ path handles any pre-existing flag.
+ .word 0xb84003a9 | (((exec_flags-g_icycles)&0x1ff)<<12)
+ cbnz w9,.Lsl_cold
+.Lsl_fetch:
+ tbnz x20,#0,.Lsl_fetch_ram
+ ubfx x10,x20,#2,#20
+ ldr x25,[x21,x10,lsl #3]
+ // Decode only the descriptor tag bits; preserve opcode, metadata and index.
+ tbz w25,#1,.Lsl_low_tag
+ tbnz w25,#0,.Lsl_native
+ // Match the canonical retry counter, including its final blocked iteration.
+ ldr x11,[x28,#16]
+ ldrb w9,[x11,x10]
+ cbz w9,.Lsl_retry_zero
+ cmp w9,#255
+ b.eq .Lsl_scalar
+ sub w9,w9,#1
+ strb w9,[x11,x10]
+ cbnz w9,.Lsl_scalar
+ and x9,x25,#0xfffffffffffffffc
+ str x9,[x21,x10,lsl #3]
+ b .Lsl_scalar
+.Lsl_fetch_ram:
+ // Writable code is fetched anew for every instruction. No native RAM cache.
+ ldur w0,[x20,#-1]
+ rev w0,w0
+ lsl x25,x0,#32
+ b .Lsl_scalar
+.Lsl_retry_zero:
+ and x9,x25,#0xfffffffffffffffc
+ str x9,[x21,x10,lsl #3]
+ b .Lsl_cold
+.Lsl_native:
+ lsr x9,x25,#32
+ cmp w9,w24
+ b.ne .Lsl_cold
+ ubfx w26,w25,#2,#5
+ add w26,w26,#1
+ sub x10,x23,x22
+ cmp x26,x10
+ b.hi .Lsl_cold
+ lsr w9,w25,#7
+ ldr x10,[x28,#24]
+ add x9,x10,w9,uxtw #2
+ ldr x10,[x28,#128]
+ strb wzr,[x10]
+ mov w10,#1
+ str w10,[x28,#148]
+ mov x0,x19
+ str x22,[x29]
+ blr x9
+ cmp w0,w26
+ b.hi .Lsl_trap
+ mov w26,w0
+ ldr w25,[x19,#256]
+ cmp w26,#4
+ mov w14,#1024
+ b.hs .Lsl_native_fast
+ // Successful short branches need no rejection or interpreter round-trip.
+ // Zero/failed-guard prefixes retain their original slow-path backoff.
+ cbz w26,.Lsl_native_short_guard
+ ldr x9,[x28,#128]
+ ldrb w9,[x9]
+ mov w14,#128
+ cbz w9,.Lsl_native_fast
+.Lsl_native_short_guard:
+ mov x0,x20
+ mov w1,w24
+ ldr x9,[x28,#120]
+ str x22,[x29]
+ blr x9
+ cbnz w26,.Lsl_native_prefix
+ str w24,[x19,#256]
+ ubfx x10,x20,#2,#20
+ ldr x25,[x21,x10,lsl #3]
+ b .Lsl_scalar
+.Lsl_native_fast:
+ // All indices address the private, allocated decoder table, even when a
+ // guest branch will later miss instruction translation. Prefetch has no
+ // architectural side effects; MMU guards still control the actual target.
+ sub w9,w25,w24
+ add x12,x20,w9,sxtw
+ ubfx x9,x12,#2,#20
+ prfm pldl1keep,[x21,x9,lsl #3]
+ // Qualified native blocks contain no calls and cannot change exec_flags.
+ // Keep their same-page target local; synthesize the original last-PC/branch
+ // post-step state only when handing control back to the C++ event loop.
+ sub w9,w26,#1
+ add x20,x20,w9,uxtw #2
+ add w24,w24,w9,lsl #2
+ add x22,x22,x9
+ // W24 is the last executed source PC in this mapped page. No context
+ // reload is needed to compare target and source page identities.
+.global sheep_page_guard_native
+.hidden sheep_page_guard_native
+sheep_page_guard_native:
+ eor w9,w25,w24
+ tst w9,#0xfffff000
+ b.ne .Lsl_native_fast_old
+ // Preserve the canonical last branch target even when consuming the branch
+ // locally. It remains observable at later event and exception boundaries.
+ add w9,w24,#4
+ cmp w25,w9
+ b.eq .Lsl_native_fast_sequential
+ .word 0xb80003b9 | (((ppc_next_instruction_address-g_icycles)&0x1ff)<<12)
+.Lsl_native_fast_sequential:
+ add x27,x27,x26
+ cmp x22,x23
+ b.hs .Lsl_native_fast_pending
+ .word 0x384003a9 | (((exec_timer-g_icycles)&0x1ff)<<12)
+ cbnz w9,.Lsl_native_fast_pending
+ cmp w27,w14
+ b.hs .Lsl_native_fast_pending
+ .word 0x384003a9 | (((power_on-g_icycles)&0x1ff)<<12)
+ cbz w9,.Lsl_native_fast_pending
+ // No device/event polling is removed: deadlines, external timer and power
+ // are checked after every bounded block, as in the original path.
+ mov x20,x12
+ mov w24,w25
+ add x22,x22,#1
+ // The native block already stored this exact target into CPU.pc.
+ b .Lsl_fetch
+.Lsl_native_fast_old:
+ // Cross-page native exits retain the exact128-instruction span cap. The
+ // helper-free leaf cannot change exec_flags; avoid publishing a synthetic
+ // BRANCH only to reload/clear it after the same polls and live mapper.
+ // NIA remains observable even when the translated target is consumed here.
+ .word 0xb80003b9 | (((ppc_next_instruction_address-g_icycles)&0x1ff)<<12)
+ add x27,x27,x26
+ cmp x22,x23
+ b.hs .Lsl_native_map_pending
+ .word 0x384003a9 | (((exec_timer-g_icycles)&0x1ff)<<12)
+ cbnz w9,.Lsl_native_map_pending
+ cmp w27,#128
+ b.hs .Lsl_native_map_pending
+ .word 0x384003a9 | (((power_on-g_icycles)&0x1ff)<<12)
+ cbz w9,.Lsl_native_map_pending
+ // A live worker-owned ROM window proves the complete target word. Reload
+ // validity on every edge; all MMU/source writers revoke it before mutation.
+ tbz x27,#32,.Lsl_native_window_miss
+ ldr x9,[x28,#200]
+ ldp w11,w12,[x9]
+ sub w11,w25,w11
+ cmp w11,w12
+ b.hs .Lsl_native_window_miss
+ ldr x9,[x9,#8]
+ add x20,x9,w25,uxtw
+ and w12,w25,#0xfffff000
+ str wzr,[x28,#192]
+ b .Lsl_native_mapped
+.Lsl_native_window_miss:
+ // Read the current primary table and mask on every cross-page edge. Keep
+ // the old tag/PAGE_MEM/host-offset/ROM-or-RAM checks, with no mapping cache.
+ adrp x9,pCurITLB1
+ ldr x9,[x9,:lo12:pCurITLB1]
+ adrp x11,tlb_size_mask
+ ldr w11,[x11,:lo12:tlb_size_mask]
+ lsr w12,w25,#12
+ and w11,w11,w12
+ add x9,x9,x11,lsl #5
+ ldp x11,x9,[x9]
+ and w12,w25,#0xfffff000
+ cmp w11,w12
+ b.ne .Lsl_native_map_pending
+ tbz x11,#32,.Lsl_native_map_pending
+ add x9,x9,w25,uxtw
+ ldr x11,[x28,#168]
+ cmp x9,x11
+ b.lo .Lsl_native_map_ram
+ ldr x11,[x28,#176]
+ cmp x9,x11
+ b.hs .Lsl_native_map_ram
+ mov x20,x9
+ str wzr,[x28,#192]
+.Lsl_native_mapped:
+ mov w24,w25
+ str w12,[x28,#96]
+ add w11,w12,#4095
+ str w11,[x28,#100]
+ // CPU.pc already contains this target. Preserve the old post-step clock
+ // and mapped-source update without rolling CPU.pc back and forward.
+ add x22,x22,#1
+ b .Lsl_fetch
+.Lsl_native_map_ram:
+ ldr w11,[x28,#196]
+ cbz w11,.Lsl_native_map_pending
+ tst x9,#3
+ b.ne .Lsl_native_map_pending
+ orr x20,x9,#1
+ mov w11,#1
+ str w11,[x28,#192]
+ b .Lsl_native_mapped
+.Lsl_native_map_pending:
+ // Every unsuccessful handoff exposes the old last-source/BRANCH state,
+ // including a sequential cross-page target or32-bit guest-PC wrap.
+ str w24,[x19,#256]
+ mov w10,#1
+ .word 0xb80003aa | (((exec_flags-g_icycles)&0x1ff)<<12)
+ b .Lsl_pending
+.Lsl_native_fast_pending:
+ str w24,[x19,#256]
+ add w9,w24,#4
+ cmp w25,w9
+ b.eq .Lsl_pending
+ mov w10,#1
+ .word 0xb80003aa | (((exec_flags-g_icycles)&0x1ff)<<12)
+ b .Lsl_pending
+.Lsl_native_prefix:
+ sub w9,w26,#1
+ add x20,x20,w9,uxtw #2
+ add w24,w24,w9,lsl #2
+ add x22,x22,x9
+ str w24,[x19,#256]
+.Lsl_native_prefix_done:
+ add w9,w24,#4
+ cmp w25,w9
+ b.ne .Lsl_native_branch
+ // Target is already proven to be source+4. Only target bits2..11==0 cross a
+ // page, including the 32-bit address wrap from fffffffc to zero.
+.global sheep_page_guard_next
+.hidden sheep_page_guard_next
+sheep_page_guard_next:
+ tst w25,#0xffc
+ b.ne .Lsl_after
+.Lsl_native_branch:
+ // All indices address the private, allocated decoder table, even when a
+ // guest branch will later miss instruction translation. Prefetch has no
+ // architectural side effects; MMU guards still control the actual target.
+ sub w9,w25,w24
+ add x9,x20,w9,sxtw
+ ubfx x9,x9,#2,#20
+ prfm pldl1keep,[x21,x9,lsl #3]
+ .word 0xb80003b9 | (((ppc_next_instruction_address-g_icycles)&0x1ff)<<12)
+ mov w10,#1
+ .word 0xb80003aa | (((exec_flags-g_icycles)&0x1ff)<<12)
+ b .Lsl_after
+.Lsl_scalar_branch:
+ // Relative B/BL and the already-qualified taken BC contain no callbacks.
+ // NIA is observable even for an explicit branch to source+4. Keep that
+ // unconditional store, but materialize BRANCH only on a pending handoff.
+ // Match the leaf native path's target-PC custody: any pending return below
+ // restores the last source before C++ performs its post-instruction step.
+ str w25,[x19,#256]
+ sub w9,w25,w24
+ add x12,x20,w9,sxtw
+ ubfx x9,x12,#2,#20
+ prfm pldl1keep,[x21,x9,lsl #3]
+ eor w9,w25,w24
+ tst w9,#0xfffff000
+ // W26 is exactly1; no native prefix PC/clock adjustment is necessary.
+ // The existing live mapper and every failed-cross-page boundary are reused.
+ b.ne .Lsl_native_fast_old
+ .word 0xb80003b9 | (((ppc_next_instruction_address-g_icycles)&0x1ff)<<12)
+ add x27,x27,x26
+ cmp x22,x23
+ b.hs .Lsl_scalar_branch_pending
+ .word 0x384003a9 | (((exec_timer-g_icycles)&0x1ff)<<12)
+ cbnz w9,.Lsl_scalar_branch_pending
+ cmp w27,#128
+ b.hs .Lsl_scalar_branch_pending
+ .word 0x384003a9 | (((power_on-g_icycles)&0x1ff)<<12)
+ cbz w9,.Lsl_scalar_branch_pending
+ mov x20,x12
+ mov w24,w25
+ add x22,x22,#1
+ b .Lsl_fetch
+.Lsl_scalar_branch_pending:
+ str w24,[x19,#256]
+ mov w10,#1
+ .word 0xb80003aa | (((exec_flags-g_icycles)&0x1ff)<<12)
+ b .Lsl_pending
+.Lsl_low_tag:
+ // Scalar tag1 falls through; native/retry routes keep their old branches.
+ tbz w25,#0,.Lsl_cold
+.Lsl_scalar:
+ mov w26,#1
+ lsr x0,x25,#32
+ lsr w9,w0,#26
+ cmp w9,#18
+ b.eq .Lsl_b
+ cmp w9,#16
+ b.eq .Lsl_bc
+.Lsl_handler:
+ tbnz x20,#0,.Lsl_ram_handler
+ // The packed descriptor stores a signed handler offset and FPU flag.
+ ldr w9,[x28,#116]
+ cbz w9,.Lsl_normal_handler
+ tbz w25,#31,.Lsl_normal_handler
+ ldr x9,[x28,#40]
+ b .Lsl_call_handler
+.Lsl_normal_handler:
+ lsl w9,w25,#1
+ asr w9,w9,#3
+ ldr x10,[x28,#32]
+ add x9,x10,w9,sxtw #2
+ b .Lsl_call_handler
+.Lsl_ram_handler:
+ // Exactly the canonical ppc_main_opcode index and selected FPU table.
+ lsr w9,w0,#15
+ and w9,w9,#0x1f800
+ and w10,w0,#0x7ff
+ orr w9,w9,w10
+ ldr x10,[x28,#184]
+ ldr x9,[x10,w9,uxtw #3]
+ b .Lsl_call_handler
+.Lsl_call_handler:
+ str x22,[x29]
+ blr x9
+ ldr x22,[x29]
+ b .Lsl_after
+.Lsl_b:
+ tbnz w0,#1,.Lsl_handler
+ tbz w0,#0,.Lsl_b_target
+ add w9,w24,#4
+ ldr w10,[x28,#112]
+ str w9,[x19,x10]
+.Lsl_b_target:
+ sbfx w9,w0,#0,#26
+ and w9,w9,#0xfffffffc
+ add w25,w24,w9
+ b .Lsl_scalar_branch
+.Lsl_bc:
+ tst w0,#3
+ b.ne .Lsl_handler
+ ubfx w9,w0,#21,#5
+ and w10,w9,#30
+ cmp w10,#4
+ b.eq .Lsl_bc_cr
+ cmp w10,#12
+ b.ne .Lsl_handler
+.Lsl_bc_cr:
+ ldr w10,[x28,#108]
+ ldr w10,[x19,x10]
+ ubfx w11,w0,#16,#5
+ mov w12,#31
+ sub w11,w12,w11
+ lsr w10,w10,w11
+ and w10,w10,#1
+ ubfx w9,w9,#3,#1
+ cmp w9,w10
+ b.ne .Lsl_after
+ sxth w9,w0
+ and w9,w9,#0xfffffffc
+ add w25,w24,w9
+ b .Lsl_scalar_branch
+.Lsl_after:
+ // Keep the final pre-increment value for ppc_exec's existing event check.
+ add x27,x27,x26
+ cmp x22,x23
+ b.hs .Lsl_pending
+ .word 0x384003a9 | (((exec_timer-g_icycles)&0x1ff)<<12)
+ cbnz w9,.Lsl_pending
+ cmp w27,#128
+ b.hs .Lsl_pending
+ .word 0x384003a9 | (((power_on-g_icycles)&0x1ff)<<12)
+ cbz w9,.Lsl_pending
+ .word 0xb84003a9 | (((exec_flags-g_icycles)&0x1ff)<<12)
+ cbz w9,.Lsl_advance
+ cmp w9,#1
+ b.ne .Lsl_pending
+ ldr x10,[x28,#64]
+ .word 0xb84003b9 | (((ppc_next_instruction_address-g_icycles)&0x1ff)<<12)
+ // Scalar callbacks cannot change the loop's mapped source W24. Keep
+ // arbitrary targets subject to the exact existing primary-ITLB mapper.
+.global sheep_page_guard_branch
+.hidden sheep_page_guard_branch
+sheep_page_guard_branch:
+ eor w9,w25,w24
+ tst w9,#0xfffff000
+ b.ne .Lsl_map_target
+ // Only a plain same-page branch can be consumed inside the fast loop.
+ sub w9,w25,w24
+ sxtw x9,w9
+ add x20,x20,x9
+ mov w24,w25
+ str wzr,[x10]
+ b .Lsl_continue
+.Lsl_advance:
+.global sheep_page_guard_advance
+.hidden sheep_page_guard_advance
+sheep_page_guard_advance:
+ add w10,w24,#4
+ // Source+4 leaves its page iff target bits2..11 are zero, even unaligned.
+ tst w10,#0xffc
+ b.ne .Lsl_advance_same
+ mov w25,w10
+ ldr x10,[x28,#64]
+ b .Lsl_map_target
+.Lsl_advance_same:
+ add w24,w24,#4
+ add x20,x20,#4
+.Lsl_continue:
+ add x22,x22,#1
+ str w24,[x19,#256]
+ b .Lsl_fetch
+.Lsl_map_target:
+ // X10 remains the original flags pointer through this no-call probe.
+ tbz x27,#32,.Lsl_window_miss
+ ldr x9,[x28,#200]
+ ldp w11,w12,[x9]
+ sub w11,w25,w11
+ cmp w11,w12
+ b.hs .Lsl_window_miss
+ ldr x9,[x9,#8]
+ add x20,x9,w25,uxtw
+ and w12,w25,#0xfffff000
+ str wzr,[x28,#192]
+ b .Lsl_mapped
+.Lsl_window_miss:
+ // A primary ITLB hit already carries the canonical translated host offset.
+ // Never walk/fill an MMU entry speculatively. Non-memory targets return to C++.
+ // The private context always binds these canonical global variables.
+ // Read their current values on every map, including after MTMSR callbacks.
+ adrp x9,pCurITLB1
+ ldr x9,[x9,:lo12:pCurITLB1]
+ adrp x11,tlb_size_mask
+ ldr w11,[x11,:lo12:tlb_size_mask]
+ lsr w12,w25,#12
+ and w11,w11,w12
+ add x9,x9,x11,lsl #5
+ // Read only canonical entry metadata early, never guest payload.
+ ldp x11,x9,[x9]
+ and w12,w25,#0xfffff000
+ cmp w11,w12
+ b.ne .Lsl_pending
+ tbz x11,#32,.Lsl_pending
+ add x9,x9,w25,uxtw
+ ldr x11,[x28,#168]
+ cmp x9,x11
+ b.lo .Lsl_target_ram
+ ldr x11,[x28,#176]
+ cmp x9,x11
+ b.hs .Lsl_target_ram
+ mov x20,x9
+ str wzr,[x28,#192]
+ b .Lsl_mapped
+.Lsl_target_ram:
+ ldr w11,[x28,#196]
+ cbz w11,.Lsl_pending
+ tst x9,#3
+ b.ne .Lsl_pending
+ orr x20,x9,#1
+ mov w11,#1
+ str w11,[x28,#192]
+.Lsl_mapped:
+ mov w24,w25
+ str w12,[x28,#96]
+ add w11,w12,#4095
+ str w11,[x28,#100]
+ str wzr,[x10]
+ b .Lsl_continue
+.Lsl_pending:
+ mov w0,#1
+ b .Lsl_return
+.Lsl_cold:
+ mov w0,#0
+.Lsl_return:
+ str x22,[x29]
+ str w27,[x28,#144]
+ and x9,x20,#0xfffffffffffffffe
+ str x9,[x28,#88]
+ ldp x19,x20,[sp]
+.cfi_restore 19
+.cfi_restore 20
+ ldp x21,x22,[sp,#16]
+.cfi_restore 21
+.cfi_restore 22
+ ldp x23,x24,[sp,#32]
+.cfi_restore 23
+.cfi_restore 24
+ ldp x25,x26,[sp,#48]
+.cfi_restore 25
+.cfi_restore 26
+ ldp x27,x28,[sp,#64]
+.cfi_restore 27
+.cfi_restore 28
+ ldp x29,x30,[sp,#80]
+.cfi_restore 29
+.cfi_restore 30
+ add sp,sp,#96
+.cfi_def_cfa_offset 0
+ ret
+.Lsl_trap:
+ str x22,[x29]
+ brk #0
+.cfi_endproc
+.size sheep_cpu_loop_a64,.-sheep_cpu_loop_a64
+)");
+#else
+extern "C" unsigned sheep_cpu_loop_a64(SheepLoopContext*){return 0;}
+#endif
+
+extern bool sheep_encode_rom_handler(uint32_t,uint32_t&);
+extern void sheep_mmu_jit_layout(nw_jit_layout*);
+extern void sheep_mmu_test_page(uint8_t*,uint32_t,uint16_t,bool);
+extern "C" uint64_t sheep_jit_abi_check(nw_jit_fn,nw_jit_cpu*);
+static void loop_fixture_reject(const uint8_t *code,uint32_t){
+ uint32_t op=uint32_t(code[0])<<24|uint32_t(code[1])<<16|uint32_t(code[2])<<8|code[3],desc;
+ if(!sheep_encode_rom_handler(op,desc))throw std::runtime_error("Steady fixture restore failed");
+ auto slot=sheep_jit_filter_slot_rom(code);sheep_rom_dispatch_words[slot]=(uint64_t(op)<<32)|desc|2;sheep_jit_reject_filter[slot]=32;
+}
+static void loop_fixture_event(uint32_t){exec_flags=EXEF_EXCEPTION|EXEF_BRANCH;ppc_next_instruction_address=0x10000040;exec_timer=true;}
+#include "tag-dispatch.inc"
+#include "flags-bfi.inc"
+int sheep_clock_publication_selftest();
+void sheep_cpu_loop_selftest(){
+ if(!sheep_clock_publication_selftest())throw std::runtime_error("Private clock publication selftest failed");
+ sheep_flags_bfi_selftest();
+ if(!sheep_direct_poll_layout())throw std::runtime_error("Direct CPU polling layout exceeds signed instruction range");
+ const auto saved=ppc_state;const auto saved_flags=exec_flags,saved_next=ppc_next_instruction_address;const auto saved_clock=g_icycles;const bool saved_timer=exec_timer,saved_power=power_on;
+ std::array<uint8_t,4096> code{},ram{},original{},native_ram{};
+ std::array<uint64_t,16> words{};std::array<unsigned char,16> counters{};unsigned passed=0;
+ constexpr uint32_t root=0x10000000,va=0x28000000;
+ for(unsigned pattern=0;pattern<17;pattern++)for(unsigned seed=0;seed<8;seed++)for(unsigned deadline: {0u,1u,7u,31u,127u,129u,511u,1025u}){
+  const bool short_case=pattern==4||pattern==15||pattern==16;
+  sheep_mmu_test_page(ram.data(),va,0x61,false);ram.fill(uint8_t(seed*13));original=ram;
+  ppc_state=saved;ppc_state.pc=root;ppc_state.gpr[3]=seed;ppc_state.gpr[4]=0;ppc_state.gpr[5]=0;ppc_state.gpr[6]=va;ppc_state.cr=seed&1?0x80000000u:0;exec_flags=0;ppc_next_instruction_address=0x31415920;exec_timer=pattern==6||(short_case&&(seed&2));power_on=pattern!=7&&!(short_case&&(seed&4));g_icycles=123;
+  uint32_t ops[]={0x38630001,0x7c642a78,0x2c03000b,0x4180fff4,0x54651838,0x90660000,0x80860000,0x4bffffe4,0x60000000,0x60000000,0x60000000,0x60000000,0x60000000,0x60000000,0x60000000,0x60000000};
+  if(pattern==9){for(auto &op:ops)op=0x60000000;ppc_state.pc=root+4080;}
+  if(pattern==10){ops[3]=0x4e800020;ppc_state.spr[SPR::LR]=root+16;}
+  if(pattern==15)ops[1]=0x4180000c;
+  if(pattern==16)ops[2]=0x41800008;
+  if(pattern==11)ops[0]=0x48001000;
+  if(pattern==12){ops[3]=0x4200fff4;ppc_state.spr[SPR::CTR]=seed+2;}
+  if(pattern==13)ops[0]=0x48000011;
+  if(pattern==4)ops[0]=0x41800010; // short native conditional prefix
+  for(unsigned i=0;i<16;i++){
+   for(unsigned j=0;j<4;j++)code[i*4+j]=uint8_t(ops[i]>>(24-j*8));
+   unsigned slot=sheep_jit_filter_slot_rom(code.data()+i*4);words[i]=sheep_rom_dispatch_words[slot];counters[i]=sheep_jit_reject_filter[slot];
+   uint32_t desc;if(!sheep_encode_rom_handler(ops[i],desc))throw std::runtime_error("Steady fixture decode failed");
+   sheep_rom_dispatch_words[slot]=(uint64_t(ops[i])<<32)|desc|1;sheep_jit_reject_filter[slot]=255;
+  }
+  auto first=sheep_jit_filter_slot_rom(code.data());
+  if(pattern==1){sheep_rom_dispatch_words[first]=(sheep_rom_dispatch_words[first]&~3ull)|2;sheep_jit_reject_filter[first]=(seed&4)?0:3;}
+  if(pattern==3)sheep_rom_dispatch_words[first]&=~3ull; // unexecuted cold source
+  nw_jit_layout layout={offsetof(SetPRS,gpr),offsetof(SetPRS,cr),offsetof(SetPRS,spr)+SPR::XER*4,offsetof(SetPRS,spr)+SPR::LR*4,offsetof(SetPRS,spr)+SPR::CTR*4,offsetof(SetPRS,pc),reinterpret_cast<void*>(1)};
+  sheep_mmu_jit_layout(&layout);layout.leaf=1;layout.memory_bail=reinterpret_cast<uintptr_t>(&sheep_jit_memory_bail);
+  if(pattern==2||pattern==4||pattern==8||pattern==15||pattern==16){
+   auto fn=nw_jit_compile_mapped(ops,8,root,&layout);if(!fn)throw std::runtime_error("Steady native fixture compile failed");
+   auto displacement=reinterpret_cast<uintptr_t>(fn)-reinterpret_cast<uintptr_t>(nw_jit_native_base());
+   sheep_rom_dispatch_words[first]=(uint64_t(root+(pattern==8?4:0))<<32)|(uint32_t((displacement>>2)<<5|7)<<2)|3;
+  }
+  if(pattern==5){
+   auto target=reinterpret_cast<uintptr_t>(&loop_fixture_event),base=reinterpret_cast<uintptr_t>(&ppc_illegalop);
+   if((target-base)&3)throw std::runtime_error("Steady event fixture handler alignment");
+   unsigned slot=sheep_jit_filter_slot_rom(code.data()+16);uint32_t desc=uint32_t(target-base)&0x7ffffffc;
+   sheep_rom_dispatch_words[slot]=(uint64_t(ops[4])<<32)|desc|1;
+  }
+  SheepLoopContext ctx{reinterpret_cast<uintptr_t>(&ppc_state),reinterpret_cast<uintptr_t>(sheep_rom_dispatch_words),reinterpret_cast<uintptr_t>(sheep_jit_reject_filter),reinterpret_cast<uintptr_t>(nw_jit_native_base()),reinterpret_cast<uintptr_t>(&ppc_illegalop),reinterpret_cast<uintptr_t>(sheep_rom_disabled_fpu_handler),reinterpret_cast<uintptr_t>(&exec_timer),reinterpret_cast<uintptr_t>(&g_icycles),reinterpret_cast<uintptr_t>(&exec_flags),reinterpret_cast<uintptr_t>(&ppc_next_instruction_address),123+deadline,code.data(),root,root+4095,offsetof(SetPRS,pc),offsetof(SetPRS,cr),offsetof(SetPRS,spr)+SPR::LR*4,ppc_opcode_grabber==OpcodeGrabberNoFPU,reinterpret_cast<uintptr_t>(&loop_fixture_reject),reinterpret_cast<uintptr_t>(&sheep_jit_memory_bail),reinterpret_cast<uintptr_t>(&power_on),0,0,reinterpret_cast<uintptr_t>(&pCurITLB1),reinterpret_cast<uintptr_t>(&tlb_size_mask),reinterpret_cast<uintptr_t>(code.data()),reinterpret_cast<uintptr_t>(code.data()+code.size())};
+  if(pattern==14)exec_flags=1u<<(seed%6);
+  const auto initial=ppc_state;auto result=sheep_jit_abi_check(reinterpret_cast<nw_jit_fn>(&sheep_cpu_loop_a64),reinterpret_cast<nw_jit_cpu*>(&ctx));
+  if(result>>32)throw std::runtime_error("Steady CPU-loop ARM64 ABI violation");
+  if((pattern==4||pattern==15||pattern==16)&&ctx.native_used&&(sheep_rom_dispatch_words[first]&3)!=3)throw std::runtime_error("ASM successful short branch entered rejection backoff");
+  const bool pending=uint32_t(result)!=0;const auto native=ppc_state;const auto native_flags=exec_flags,native_next=ppc_next_instruction_address;const auto native_clock=g_icycles;const auto native_timer=exec_timer;native_ram=ram;
+  if(ctx.retired>1056||(!ctx.retired&&pending)||ctx.retired>deadline+1)throw std::runtime_error("Steady loop retired/event budget differs");
+  ppc_state=initial;ram=original;exec_flags=pattern==14?(1u<<(seed%6)):0;ppc_next_instruction_address=0x31415920;exec_timer=pattern==6||(short_case&&(seed&2));g_icycles=123;
+  uint8_t *host=code.data();
+  for(unsigned i=0;i<ctx.retired;i++){
+   unsigned index=(ppc_state.pc-initial.pc)/4;if(index>=16)throw std::runtime_error("Steady replay left fixture page");
+   if(pattern==5&&index==4)loop_fixture_event(ops[index]);else ppc_main_opcode(ppc_opcode_grabber,ops[index]);
+   if(i+1==ctx.retired&&pending)break;
+   uint32_t before=ppc_state.pc;
+   if(exec_flags&EXEF_BRANCH){ppc_state.pc=ppc_next_instruction_address;exec_flags=0;}else ppc_state.pc+=4;
+   host+=int64_t(ppc_state.pc)-before;g_icycles++;
+  }
+  if(std::memcmp(&native,&ppc_state,sizeof(native))||native_ram!=ram||native_flags!=exec_flags||native_next!=ppc_next_instruction_address||native_clock!=g_icycles||native_timer!=exec_timer||ctx.host!=host){
+   fprintf(stderr,"STEADY failure pattern=%u seed=%u deadline=%u retired=%u pending=%u pc=%08x/%08x cycles=%llu/%llu flags=%x/%x host=%td/%td\n",pattern,seed,deadline,ctx.retired,pending,native.pc,ppc_state.pc,(unsigned long long)native_clock,(unsigned long long)g_icycles,native_flags,exec_flags,ctx.host-code.data(),host-code.data());
+   throw std::runtime_error("Steady CPU-loop CPU/RAM/clock/flags/source-PC differs");
+  }
+  for(unsigned i=0;i<16;i++){unsigned slot=sheep_jit_filter_slot_rom(code.data()+i*4);sheep_rom_dispatch_words[slot]=words[i];sheep_jit_reject_filter[slot]=counters[i];}
+  sheep_mmu_test_page(nullptr,0,0,false);passed++;
+ }
+ ppc_state=saved;exec_flags=saved_flags;ppc_next_instruction_address=saved_next;g_icycles=saved_clock;exec_timer=saved_timer;power_on=saved_power;
+ fprintf(stderr,"STEADY LOOP SELFTEST %u CPU/RAM/ABI/native/branch/cold/retry/event/clock/source cases passed\n",passed);
+}
+
+static void loop_fixture_rfi(uint32_t){exec_flags=EXEF_RFI|EXEF_BRANCH;ppc_next_instruction_address=0x10001000;}
+void sheep_cpu_loop_cross_selftest(){
+ const auto saved=ppc_state;const auto flags=exec_flags,next=ppc_next_instruction_address;const auto clock=g_icycles;const bool timer=exec_timer,power=power_on;const auto table=pCurITLB1;const auto mask=tlb_size_mask;
+ std::array<uint8_t,12288> code{};std::array<uint8_t,4096> other_ram{};alignas(32) std::array<uint8_t,256> itlb{};
+ std::array<uint64_t,3072> old_words{};std::array<uint8_t,3072> old_counters{};unsigned passed=0;
+ for(unsigned i=0;i<3072;i++){auto slot=sheep_jit_filter_slot_rom(code.data()+i*4);old_words[i]=sheep_rom_dispatch_words[slot];old_counters[i]=sheep_jit_reject_filter[slot];}
+ auto put=[&](unsigned offset,uint32_t op,uintptr_t handler=0){
+  for(unsigned j=0;j<4;j++)code[offset+j]=uint8_t(op>>(24-j*8));uint32_t desc;
+  if(handler)desc=uint32_t(handler-reinterpret_cast<uintptr_t>(&ppc_illegalop))&0x7ffffffc;
+  else if(!sheep_encode_rom_handler(op,desc))throw std::runtime_error("Cross-page fixture decode failed");
+  auto slot=sheep_jit_filter_slot_rom(code.data()+offset);sheep_rom_dispatch_words[slot]=(uint64_t(op)<<32)|desc|1;sheep_jit_reject_filter[slot]=255;
+ };
+ for(unsigned pattern=0;pattern<9;pattern++)for(unsigned seed=0;seed<4;seed++)for(unsigned deadline:{0u,1u,7u,31u,127u,129u,511u,1025u}){
+  for(unsigned i=0;i<3072;i++)put(i*4,0x60000000);
+  uint32_t root=pattern==7?0xfffff000u:0x10000000u,second=root+4096;
+  for(unsigned i=0;i<8;i++){uint32_t invalid=0xffffffffu;std::memcpy(itlb.data()+i*32,&invalid,4);}
+  auto map=[&](uint32_t page,uint8_t *host){auto *entry=itlb.data()+((page>>12)&7)*32;int64_t offset=int64_t(reinterpret_cast<uintptr_t>(host))-page;uint16_t memory=1;std::memcpy(entry,&page,4);std::memcpy(entry+4,&memory,2);std::memcpy(entry+8,&offset,8);};
+  auto *target=code.data()+(pattern==1?8192:4096);
+  map(root,code.data());map(second,target);
+  if(pattern==2||pattern==6){uint32_t invalid=second^4096;std::memcpy(itlb.data()+((second>>12)&7)*32,&invalid,4);}
+  if(pattern==3)map(second,reinterpret_cast<uint8_t*>(uintptr_t(0x56780000)));
+  if(pattern==8)map(second,other_ram.data());
+  pCurITLB1=reinterpret_cast<TLBEntry*>(itlb.data());tlb_size_mask=7;
+  ppc_state=saved;ppc_state.pc=root;exec_flags=0;ppc_next_instruction_address=0x31415920;exec_timer=false;power_on=true;g_icycles=123+seed*100;
+  if(pattern==5||pattern==6||pattern==7)ppc_state.pc=root+4080;
+  else if(pattern==4)put(0,0x60000000,reinterpret_cast<uintptr_t>(&loop_fixture_rfi));
+  else{put(0,0x48001000);put(pattern==1?8192:4096,0x4bfff000);}
+  auto *initial_host=sheep_itlb_primary_hit(ppc_state.pc);if(!initial_host)throw std::runtime_error("Cross-page fixture root mapping missing");
+  SheepLoopContext ctx{reinterpret_cast<uintptr_t>(&ppc_state),reinterpret_cast<uintptr_t>(sheep_rom_dispatch_words),reinterpret_cast<uintptr_t>(sheep_jit_reject_filter),reinterpret_cast<uintptr_t>(nw_jit_native_base()),reinterpret_cast<uintptr_t>(&ppc_illegalop),reinterpret_cast<uintptr_t>(sheep_rom_disabled_fpu_handler),reinterpret_cast<uintptr_t>(&exec_timer),reinterpret_cast<uintptr_t>(&g_icycles),reinterpret_cast<uintptr_t>(&exec_flags),reinterpret_cast<uintptr_t>(&ppc_next_instruction_address),g_icycles+deadline,initial_host,root,root+4095,offsetof(SetPRS,pc),offsetof(SetPRS,cr),offsetof(SetPRS,spr)+SPR::LR*4,ppc_opcode_grabber==OpcodeGrabberNoFPU,reinterpret_cast<uintptr_t>(&loop_fixture_reject),reinterpret_cast<uintptr_t>(&sheep_jit_memory_bail),reinterpret_cast<uintptr_t>(&power_on),0,0,reinterpret_cast<uintptr_t>(&pCurITLB1),reinterpret_cast<uintptr_t>(&tlb_size_mask),reinterpret_cast<uintptr_t>(code.data()),reinterpret_cast<uintptr_t>(code.data()+code.size())};
+  const auto initial=ppc_state;const auto initial_clock=g_icycles;
+  auto result=sheep_jit_abi_check(reinterpret_cast<nw_jit_fn>(&sheep_cpu_loop_a64),reinterpret_cast<nw_jit_cpu*>(&ctx));
+  if(result>>32||uint32_t(result)!=1||!ctx.retired||ctx.retired>128||ctx.retired>deadline+1)throw std::runtime_error("Cross-page loop ABI/count/deadline differs");
+  const auto native=ppc_state;const auto native_flags=exec_flags,native_next=ppc_next_instruction_address;const auto native_clock=g_icycles;
+  ppc_state=initial;exec_flags=0;ppc_next_instruction_address=0x31415920;g_icycles=initial_clock;
+  for(unsigned i=0;i<ctx.retired;i++){
+   auto *host=sheep_itlb_primary_hit(ppc_state.pc);if(!host||host<code.data()||host>=code.data()+code.size())throw std::runtime_error("Cross-page replay left readonly fixture");
+   uint32_t op=uint32_t(host[0])<<24|uint32_t(host[1])<<16|uint32_t(host[2])<<8|host[3];
+   if(pattern==4&&ppc_state.pc==root)loop_fixture_rfi(op);else ppc_main_opcode(ppc_opcode_grabber,op);
+   if(i+1==ctx.retired)break;
+   ppc_state.pc=exec_flags&EXEF_BRANCH?ppc_next_instruction_address:ppc_state.pc+4;exec_flags=0;g_icycles++;
+  }
+  auto *last_host=sheep_itlb_primary_hit(ppc_state.pc);
+  if(std::memcmp(&native,&ppc_state,sizeof(native))||native_flags!=exec_flags||native_next!=ppc_next_instruction_address||native_clock!=g_icycles||ctx.host!=last_host||ctx.page_start!=(ppc_state.pc&~4095u)||ctx.page_end!=uint32_t(ctx.page_start+4095)){
+   fprintf(stderr,"CROSS LOOP pattern=%u seed=%u deadline=%u retired=%u pc=%08x/%08x cycles=%llu/%llu flags=%x/%x page=%08x host=%td/%td\n",pattern,seed,deadline,ctx.retired,native.pc,ppc_state.pc,(unsigned long long)native_clock,(unsigned long long)g_icycles,native_flags,exec_flags,ctx.page_start,ctx.host-code.data(),last_host-code.data());
+   throw std::runtime_error("Cross-page loop CPU/clock/flags/mapping/alias/source differs");
+  }
+  if((pattern==2||pattern==3||pattern==4||pattern==8)&&ctx.retired!=1)throw std::runtime_error("Cross-page miss/RFI/non-ROM guard consumed extra code");
+  if(pattern==6&&ctx.retired!=std::min(4u,deadline+1))throw std::runtime_error("Sequential page miss consumed extra code");
+  passed++;
+ }
+ for(unsigned i=0;i<3072;i++){auto slot=sheep_jit_filter_slot_rom(code.data()+i*4);sheep_rom_dispatch_words[slot]=old_words[i];sheep_jit_reject_filter[slot]=old_counters[i];}
+ ppc_state=saved;exec_flags=flags;ppc_next_instruction_address=next;g_icycles=clock;exec_timer=timer;power_on=power;pCurITLB1=table;tlb_size_mask=mask;
+ fprintf(stderr,"CROSS PAGE LOOP SELFTEST %u branch/sequential/alias/wrap/miss/RFI/non-ROM/ABI/clock cases passed\n",passed);
+}
+
+void sheep_cpu_loop_ram_selftest(){
+ const auto saved=ppc_state;const auto flags=exec_flags,next=ppc_next_instruction_address;const auto clock=g_icycles;const bool timer=exec_timer,power=power_on;const auto table=pCurITLB1;const auto mask=tlb_size_mask;
+ alignas(16) std::array<uint8_t,8192> code{},initial_code{},native_code{};std::array<uint8_t,4096> ram{},initial_ram{},native_ram{};alignas(32) std::array<uint8_t,256> itlb{};
+ constexpr uint32_t root=0x10000000,va=0x28000000;
+ const auto a=sheep_jit_filter_slot_rom(code.data()),b=sheep_jit_filter_slot_rom(code.data()+4096);const auto aw=sheep_rom_dispatch_words[a],bw=sheep_rom_dispatch_words[b];const auto ac=sheep_jit_reject_filter[a],bc=sheep_jit_reject_filter[b];unsigned passed=0;
+ auto put=[&](unsigned offset,uint32_t op){for(unsigned j=0;j<4;j++)code[offset+j]=uint8_t(op>>(24-j*8));};
+ for(unsigned pattern=0;pattern<9;pattern++)for(unsigned seed=0;seed<8;seed++)for(unsigned deadline:{0u,1u,7u,31u,127u,129u,511u,1025u}){
+  for(unsigned i=0;i<8192;i+=4)put(i,0x60000000);
+  for(unsigned i=0;i<4096;i++)ram[i]=uint8_t(i*7+seed*13);
+  for(unsigned i=0;i<8;i++){uint32_t invalid=0xffffffffu;std::memcpy(itlb.data()+i*32,&invalid,4);}
+  auto map=[&](uint32_t page,uint8_t *host,uint16_t flags=1){auto *entry=itlb.data()+((page>>12)&7)*32;int64_t offset=int64_t(reinterpret_cast<uintptr_t>(host))-page;std::memcpy(entry,&page,4);std::memcpy(entry+4,&flags,2);std::memcpy(entry+8,&offset,8);};
+  map(root,code.data());map(root+4096,code.data()+4096);
+  bool smc=pattern==1||pattern==6||pattern==8;
+  sheep_mmu_test_page(smc?code.data():ram.data(),smc?(pattern==6?root+4096:root):va,0x61,false);
+  pCurITLB1=reinterpret_cast<TLBEntry*>(itlb.data());tlb_size_mask=7;
+  ppc_state=saved;ppc_state.pc=pattern==3?root+4096:root;ppc_state.gpr[3]=seed;ppc_state.gpr[4]=0;ppc_state.gpr[5]=0;ppc_state.gpr[6]=smc?(pattern==6?root+4096:root):va;ppc_state.gpr[7]=pattern==8?0x48000008u:0x38630009u;ppc_state.cr=0;exec_flags=0;ppc_next_instruction_address=0x31415920;exec_timer=false;power_on=true;g_icycles=123;
+  sheep_rom_dispatch_words[a]=aw;sheep_rom_dispatch_words[b]=bw;
+  if(pattern==2||pattern==3||pattern==4||pattern==5){
+   put(0,0x48001000);put(4096,0x4bfff000);uint32_t desc;if(!sheep_encode_rom_handler(0x4bfff000,desc))throw std::runtime_error("Live RAM fixture decoder unavailable");sheep_rom_dispatch_words[b]=(uint64_t(0x4bfff000)<<32)|desc|1;
+  }else if(smc){
+   put(0,0x90e60014);put(4,0x38630001); // STW r7,20(r6), then ADDI r3,1
+   if(pattern==8){put(24,0x38630007);put(28,0x38630009);} // injected branch skips ADDI #7
+  }else{
+   uint32_t ops[]={0x38630001,0x7c642a78,0x2c03000b,0x4180fff4,0x54651838,0x90660000,0x80860000,0x4bffffe4};for(unsigned i=0;i<8;i++)put(i*4,ops[i]);
+  }
+  if(pattern==4)map(root+4096,reinterpret_cast<uint8_t*>(uintptr_t(0x56780000)),2); // I/O, never raw fetched
+  if(pattern==5){uint32_t invalid=0xffffffffu;std::memcpy(itlb.data()+32,&invalid,4);}
+  if(pattern==7)sheep_rom_dispatch_words[a]=0xffffffff00000003ull; // RAM must ignore ROM/native metadata
+  initial_code=code;initial_ram=ram;
+  auto *initial_host=sheep_itlb_primary_hit(ppc_state.pc);
+  SheepLoopContext ctx{reinterpret_cast<uintptr_t>(&ppc_state),reinterpret_cast<uintptr_t>(sheep_rom_dispatch_words),reinterpret_cast<uintptr_t>(sheep_jit_reject_filter),reinterpret_cast<uintptr_t>(nw_jit_native_base()),reinterpret_cast<uintptr_t>(&ppc_illegalop),reinterpret_cast<uintptr_t>(sheep_rom_disabled_fpu_handler),reinterpret_cast<uintptr_t>(&exec_timer),reinterpret_cast<uintptr_t>(&g_icycles),reinterpret_cast<uintptr_t>(&exec_flags),reinterpret_cast<uintptr_t>(&ppc_next_instruction_address),123+deadline,initial_host,ppc_state.pc&~4095u,uint32_t((ppc_state.pc&~4095u)+4095),offsetof(SetPRS,pc),offsetof(SetPRS,cr),offsetof(SetPRS,spr)+SPR::LR*4,ppc_opcode_grabber==OpcodeGrabberNoFPU,reinterpret_cast<uintptr_t>(&loop_fixture_reject),reinterpret_cast<uintptr_t>(&sheep_jit_memory_bail),reinterpret_cast<uintptr_t>(&power_on),0,0,reinterpret_cast<uintptr_t>(&pCurITLB1),reinterpret_cast<uintptr_t>(&tlb_size_mask),reinterpret_cast<uintptr_t>(code.data()+4096),reinterpret_cast<uintptr_t>(code.data()+8192),reinterpret_cast<uintptr_t>(ppc_opcode_grabber),pattern==3?0u:1u,1};
+  const auto initial=ppc_state;auto result=sheep_jit_abi_check(reinterpret_cast<nw_jit_fn>(&sheep_cpu_loop_a64),reinterpret_cast<nw_jit_cpu*>(&ctx));
+  if(result>>32||uint32_t(result)!=1||!ctx.retired||ctx.retired>128||ctx.retired>deadline+1)throw std::runtime_error("Live RAM loop ABI/event/count differs");
+  const auto native=ppc_state;const auto native_flags=exec_flags,native_next=ppc_next_instruction_address;const auto native_clock=g_icycles;native_code=code;native_ram=ram;
+  code=initial_code;ram=initial_ram;ppc_state=initial;exec_flags=0;ppc_next_instruction_address=0x31415920;g_icycles=123;
+  for(unsigned i=0;i<ctx.retired;i++){
+   auto *host=sheep_itlb_primary_hit(ppc_state.pc);if(!host||host<code.data()||host+4>code.data()+code.size())throw std::runtime_error("Live RAM replay mapping unavailable");
+   uint32_t op=uint32_t(host[0])<<24|uint32_t(host[1])<<16|uint32_t(host[2])<<8|host[3];ppc_main_opcode(ppc_opcode_grabber,op);
+   if(i+1==ctx.retired)break;
+   ppc_state.pc=exec_flags&EXEF_BRANCH?ppc_next_instruction_address:ppc_state.pc+4;exec_flags=0;g_icycles++;
+  }
+  auto *last_host=sheep_itlb_primary_hit(ppc_state.pc);bool last_ram=last_host<code.data()+4096||last_host>=code.data()+8192;
+  if(std::memcmp(&native,&ppc_state,sizeof(native))||code!=native_code||ram!=native_ram||native_flags!=exec_flags||native_next!=ppc_next_instruction_address||native_clock!=g_icycles||ctx.host!=last_host||ctx.page_start!=(ppc_state.pc&~4095u)||bool(ctx.source_ram)!=last_ram){
+   fprintf(stderr,"LIVE RAM pattern=%u seed=%u deadline=%u retired=%u pc=%08x/%08x cycles=%llu/%llu flags=%x/%x mode=%u/%u host=%td/%td\n",pattern,seed,deadline,ctx.retired,native.pc,ppc_state.pc,(unsigned long long)native_clock,(unsigned long long)g_icycles,native_flags,exec_flags,ctx.source_ram,last_ram,ctx.host-code.data(),last_host-code.data());
+   throw std::runtime_error("Live RAM loop CPU/code/SMC/data/clock/flags/mapping differs");
+  }
+  if((pattern==4||pattern==5)&&ctx.retired!=1)throw std::runtime_error("Live RAM I/O/miss guard consumed extra code");
+  if((pattern==1||pattern==6)&&ctx.retired>=6&&ppc_state.gpr[3]!=seed+10)throw std::runtime_error("Live RAM used stale self-modified arithmetic");
+  sheep_mmu_test_page(nullptr,0,0,false);passed++;
+ }
+ sheep_rom_dispatch_words[a]=aw;sheep_rom_dispatch_words[b]=bw;sheep_jit_reject_filter[a]=ac;sheep_jit_reject_filter[b]=bc;
+ ppc_state=saved;exec_flags=flags;ppc_next_instruction_address=next;g_icycles=clock;exec_timer=timer;power_on=power;pCurITLB1=table;tlb_size_mask=mask;
+ fprintf(stderr,"LIVE RAM LOOP SELFTEST %u CPU/RAM/SMC/alias/ROM-switch/I-O/miss/ABI/event/clock cases passed\n",passed);
+}
+
+#include "page-guards.inc"
+#include "live-itlb.inc"
+
+template <ppc_exec_type_t exec_type, endian_switch endian, bool rom_profile = false, unsigned fixture_path = 0>
 static void ppc_exec_inner(uint32_t start_addr, uint32_t size)
 {
-    uint64_t max_cycles = 0;
+    // Private fixture instantiations avoid touching live TimerManager queues.
+    static_assert(fixture_path <= 3, "Invalid private dispatcher fixture path");
+    uint64_t max_cycles = fixture_path ? ~uint64_t(0) : 0;
     uint32_t page_start, eb_start, eb_end = 0;
     uint32_t opcode;
     PPCOpcode* opcode_grabber = ppc_opcode_grabber;
+    const bool sheep_enabled = sheep_jit_enabled();
+    const SheepROMWindow *rom_window = nullptr;
+    if constexpr (exec_type == main && endian == big_end && rom_profile && (fixture_path == 0 || fixture_path == 3)) {
+        const char *window_setting = std::getenv("SHEEP_PIPPIN_ROM_WINDOW");
+        if (sheep_enabled && (fixture_path == 3 || (window_setting && !std::strcmp(window_setting,"on"))))
+            rom_window = sheep_mmu_rom_window_get();
+    }
+    PPCOpcode *compact_decoder = sheep_compact_decoder(opcode_grabber);
+    uint64_t compact_mask = compact_decoder ? sheep_compact_primary_mask : 0;
+    const bool decode_rom = rom_profile && sheep_rom_decode_ready;
     uint8_t* pc_real;
+    bool sheep_page_enabled = false,steady_page_enabled=false;
+    auto validate_window_registration = [&]() {
+        if(!rom_window || !rom_window->valid_start_count)return;
+        const uintptr_t first=uintptr_t(rom_window->guest_start)+rom_window->host_offset;
+        const uintptr_t bytes=uintptr_t(rom_window->valid_start_count)+3u;
+        if(first<sheep_rom_host_begin || first>=sheep_rom_host_end || bytes>sheep_rom_host_end-first)
+            sheep_mmu_rom_window_invalidate();
+    };
+    // The MMU proves the current actual ROM; the dispatcher additionally binds
+    // its complete span to the registered decoded-ROM allocation, only cold.
+    validate_window_registration();
+    auto refresh_sheep_window = [&](uint32_t pc) {
+        if(sheep_mmu_rom_window_cold_refresh(pc,pc_real))validate_window_registration();
+    };
+    auto update_sheep_page = [&](uint32_t pc, bool allow_window_refresh = true) {
+        if constexpr (exec_type == main && endian == big_end)
+        {
+            sheep_page_enabled = sheep_enabled && sheep_jit_code_page_enabled(pc_real, pc);
+            steady_page_enabled=sheep_page_enabled;
+            if(!steady_page_enabled&&sheep_itlb_primary_enabled&&sheep_itlb_primary_hit(pc)==pc_real){
+                const auto *entry=reinterpret_cast<const uint8_t*>(pCurITLB1)+size_t((pc>>12)&tlb_size_mask)*32;
+                uint16_t flags;std::memcpy(&flags,entry+4,2);steady_page_enabled=(flags&1)!=0;
+            }
+            if(allow_window_refresh && rom_window && !rom_window->valid_start_count && sheep_page_enabled && !exec_flags)
+                refresh_sheep_window(pc);
+        }
+    };
 
+    auto translate_instruction = [&](uint32_t pc, uint32_t *physical=nullptr) {
+        if constexpr (rom_profile) return sheep_translate_imem(pc, physical);
+        return mmu_translate_imem(pc, physical);
+    };
+
+    SheepLoopContext steady{};
+    steady.cpu=reinterpret_cast<uintptr_t>(&ppc_state);
+    steady.words=reinterpret_cast<uintptr_t>(sheep_rom_dispatch_words);
+    steady.counters=reinterpret_cast<uintptr_t>(sheep_jit_reject_filter);
+    steady.illegal=reinterpret_cast<uintptr_t>(&ppc_illegalop);
+    steady.fpu_disabled=reinterpret_cast<uintptr_t>(sheep_rom_disabled_fpu_handler);
+    steady.timer=reinterpret_cast<uintptr_t>(&exec_timer);
+    steady.clock=reinterpret_cast<uintptr_t>(&g_icycles);
+    steady.flags=reinterpret_cast<uintptr_t>(&exec_flags);
+    steady.next=reinterpret_cast<uintptr_t>(&ppc_next_instruction_address);
+    steady.pc_offset=offsetof(SetPRS,pc);steady.cr_offset=offsetof(SetPRS,cr);
+    steady.lr_offset=offsetof(SetPRS,spr)+SPR::LR*4;
+    steady.reject=reinterpret_cast<uintptr_t>(&sheep_cpu_loop_reject);
+    steady.memory_bail=reinterpret_cast<uintptr_t>(&sheep_jit_memory_bail);
+    steady.power=reinterpret_cast<uintptr_t>(&power_on);
+    steady.itlb=reinterpret_cast<uintptr_t>(&pCurITLB1);steady.mask=reinterpret_cast<uintptr_t>(&tlb_size_mask);
+    steady.rom_begin=sheep_rom_host_begin;steady.rom_end=sheep_rom_host_end;steady.window=rom_window;
+    const char *steady_setting=std::getenv("SHEEP_PIPPIN_CPU_LOOP");
+    const bool steady_enabled=fixture_path ? (fixture_path==2 || fixture_path==3) : ((!steady_setting||std::strcmp(steady_setting,"off"))&&sheep_direct_poll_layout());
+    const char *ram_setting=std::getenv("SHEEP_PIPPIN_CPU_RAM");
+    steady.allow_ram=!ram_setting||std::strcmp(ram_setting,"off");
     while (power_on) {
         if (exec_type == debug)
             if (ppc_state.pc >= start_addr && ppc_state.pc < start_addr + size)
@@ -474,11 +1476,89 @@ static void ppc_exec_inner(uint32_t start_addr, uint32_t size)
             page_start = eb_start & PPC_PAGE_MASK;
             eb_end     = page_start + PPC_PAGE_SIZE - 1;
             exec_flags = 0;
-            pc_real    = mmu_translate_imem(eb_start ATPCP); // &pcp
+            pc_real    = translate_instruction(eb_start ATPCP); // &pcp
+            update_sheep_page(eb_start);
         }
 
-        opcode = ppc_read_instruction(pc_real);
-        ppc_main_opcode(opcode_grabber, opcode);
+        bool steady_step=false;
+#if defined(__aarch64__) && !defined(LOG_INSTRUCTIONS) && !defined(CPU_PROFILING)
+        if constexpr(exec_type==main && endian==big_end && rom_profile){
+            if(steady_enabled && steady_page_enabled && (sheep_page_enabled||steady.allow_ram) && !(reinterpret_cast<uintptr_t>(pc_real)&3) && sheep_rom_decode_ready && sheep_itlb_primary_enabled && sheep_rom_direct_enabled && !exec_timer && g_icycles<max_cycles){
+                steady.native_base=sheep_rom_direct_base;steady.max_cycles=max_cycles;
+                steady.host=pc_real;steady.page_start=page_start;steady.page_end=eb_end;
+                steady.disabled=opcode_grabber==OpcodeGrabberNoFPU;
+                steady.opcodes=reinterpret_cast<uintptr_t>(opcode_grabber);
+                steady.source_ram=!sheep_jit_code_page_enabled(pc_real,ppc_state.pc);
+                steady_step=sheep_cpu_loop_a64(&steady)!=0;
+                if(steady.native_used)sheep_hot_used=true;
+                sheep_steady_spans++;sheep_steady_instructions+=steady.retired;
+                pc_real=steady.host;page_start=steady.page_start;eb_end=steady.page_end;update_sheep_page(ppc_state.pc,!steady_step);
+            }
+        }
+#endif
+        if(!steady_step){
+        // A window hit may reach cold code without populating its primary ITLB.
+        // This is an unexecuted opcode: canonical fetch precedes classification.
+        // Pending returns reach the original event/flag handling first instead.
+        if(rom_window && !exec_flags && rom_window->valid_start_count &&
+           uint32_t(ppc_state.pc-rom_window->guest_start)<rom_window->valid_start_count &&
+           uintptr_t(pc_real)==uintptr_t(ppc_state.pc)+rom_window->host_offset &&
+           sheep_itlb_primary_hit(ppc_state.pc)!=pc_real){
+            pc_real=translate_instruction(ppc_state.pc ATPCP);
+            page_start=ppc_state.pc&PPC_PAGE_MASK;eb_end=page_start+PPC_PAGE_SIZE-1;
+            update_sheep_page(ppc_state.pc);
+        }
+        unsigned jit_count = 0;
+        bool decoded_instruction = false;
+        uint64_t decoded_word = 0;
+        if constexpr (exec_type == main && endian == big_end) {
+            if (sheep_page_enabled) {
+                bool blocked;bool direct_handled=false;
+                if constexpr (rom_profile) {
+                    unsigned slot = sheep_jit_filter_slot_rom(pc_real);
+                    uint64_t word = sheep_rom_dispatch_words[slot];
+                    if((word&3)==3&&!exec_timer&&g_icycles<max_cycles)
+                        direct_handled=sheep_jit_rom_direct(slot,word,max_cycles-g_icycles,jit_count);
+                    blocked=(word&3)==3?false:sheep_rom_dispatch_blocked_word(slot,word);
+                    decoded_instruction = decode_rom;
+                    decoded_word = word;
+                } else {
+                    auto &reject = sheep_jit_reject_filter[sheep_jit_filter_slot_general(pc_real, ppc_state.pc)];
+                    blocked = reject != 0;
+                    if (reject && reject != 255) --reject;
+                }
+                if (!direct_handled && !blocked && !exec_timer && g_icycles < max_cycles) {
+                    if(!sheep_jit_hot<true>(pc_real,max_cycles-g_icycles,jit_count)) {
+                        unsigned budget = std::min<uint64_t>(sheep_native_max_ops, max_cycles - g_icycles);
+                        budget = std::min(budget, (eb_end - ppc_state.pc + 1) / 4);
+                        unsigned decode_bound=0;
+                        if constexpr(rom_profile)decode_bound=sheep_rom_plan_bound(pc_real,ppc_state.pc,eb_end);
+                        jit_count = sheep_jit_try(pc_real, budget,decode_bound);
+                        if (jit_count) ppc_state.pc += (jit_count - 1) * 4;
+                    }
+                }
+            }
+        }
+        if (jit_count) {
+            g_icycles += jit_count - 1;
+            INCPC((jit_count - 1) * 4);
+        } else {
+            opcode = decoded_instruction && (decoded_word&3)!=3 ? uint32_t(decoded_word >> 32) : ppc_read_instruction(pc_real);
+#if !defined(CPU_PROFILING) && !defined(LOG_INSTRUCTIONS)
+            if constexpr (rom_profile) {
+                unsigned primary = opcode >> 26;
+                if (sheep_execute_simple_branch(opcode)) {}
+                else if (decoded_instruction && (decoded_word&3)!=3 && compact_decoder)
+                    sheep_rom_cached_handler(decoded_word, opcode_grabber == OpcodeGrabberNoFPU)(opcode);
+                else if (compact_mask & (uint64_t(1) << primary))
+                    compact_decoder[primary * 4 + (opcode & 3)](opcode);
+                else
+                    ppc_main_opcode(opcode_grabber, opcode);
+            } else
+#endif
+                ppc_main_opcode(opcode_grabber, opcode);
+        }
+        } // Original cold dispatcher or exactly one pending steady-loop step.
         if (g_icycles++ >= max_cycles || exec_timer) [[unlikely]]
             max_cycles = process_events();
 
@@ -496,20 +1576,25 @@ static void ppc_exec_inner(uint32_t start_addr, uint32_t size)
                     }
                 }
             }
-            if (exec_flags & EXEF_OPC_DECODER) [[unlikely]] {
+            if (exec_flags & (EXEF_OPC_DECODER | EXEF_EXCEPTION)) [[unlikely]] {
                 opcode_grabber = ppc_opcode_grabber;
+                compact_decoder = sheep_compact_decoder(opcode_grabber);
+                compact_mask = compact_decoder ? sheep_compact_primary_mask : 0;
             }
             // define next execution block
             eb_start = ppc_next_instruction_address;
-            if (!(exec_flags & EXEF_RFI) && (eb_start & PPC_PAGE_MASK) == page_start) {
+            if (!(exec_flags & (EXEF_RFI | EXEF_EXCEPTION | EXEF_FETCH)) && (eb_start & PPC_PAGE_MASK) == page_start) {
                 if (endian == big_end)
                     INCPC((int)eb_start - (int)ppc_state.pc);
-                else
-                    pc_real = mmu_translate_imem(eb_start ATPCP); // &pcp
+                else {
+                    pc_real = translate_instruction(eb_start ATPCP); // &pcp
+                    update_sheep_page(eb_start);
+                }
             } else {
                 page_start = eb_start & PPC_PAGE_MASK;
                 eb_end = page_start + PPC_PAGE_SIZE - 1;
-                pc_real = mmu_translate_imem(eb_start ATPCP); // &pcp
+                pc_real = translate_instruction(eb_start ATPCP); // &pcp
+                update_sheep_page(eb_start);
             }
             ppc_state.pc = eb_start;
             exec_flags = 0;
@@ -517,15 +1602,25 @@ static void ppc_exec_inner(uint32_t start_addr, uint32_t size)
             ppc_state.pc += 4;
             if (endian == big_end)
                 INCPC(4);
-            else
-                pc_real = mmu_translate_imem(ppc_state.pc ATPCP); // &pcp
+            else {
+                pc_real = translate_instruction(ppc_state.pc ATPCP); // &pcp
+                update_sheep_page(ppc_state.pc);
+            }
         }
+
+        // Revoked windows are requalified only after event/flag processing and
+        // an already-settled canonical source proof; never fetch a pending target.
+        if(rom_window && !rom_window->valid_start_count && power_on && sheep_page_enabled &&
+           sheep_itlb_primary_hit(ppc_state.pc)==pc_real)
+            refresh_sheep_window(ppc_state.pc);
 
         if (exec_type == until)
             if (ppc_state.pc == start_addr)
                 break;
     }
 }
+
+#include "fetch-barriers.inc"
 
 /** Execute PPC code as long as power is on. */
 
@@ -549,7 +1644,10 @@ void ppc_exec()
         else
 #endif
         [[likely]] {
-            ppc_exec_inner<main, big_end>(0, 0);
+            if (sheep_jit_enabled() && sheep_rom_only)
+                ppc_exec_inner<main, big_end, true>(0, 0);
+            else
+                ppc_exec_inner<main, big_end>(0, 0);
         }
         if (!power_on && power_off_reason == po_endian_switch) [[unlikely]] {
             power_on = true;
@@ -1010,10 +2108,12 @@ void initialize_ppc_opcode_table() {
             OpcodeGrabberNoFPU[i] = OpcodeGrabber[i];
         }
     }
+    sheep_build_compact_decoders();
 }
 
 void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool do_include_601, uint64_t tb_freq)
 {
+    sheep_mmu_rom_window_enable(false);
     mem_ctrl_instance = mem_ctrl;
 
     int_pin = false;
@@ -1264,5 +2364,14 @@ uint64_t get_reg(string reg_name) {
 }
 
 void set_reg(string reg_name, uint64_t val) {
+    sheep_mmu_rom_window_invalidate();
     reg_op(reg_name, val, true);
 }
+
+#include "generic-continuation-tests.inc"
+
+#include "scalar-branch-tests.inc"
+
+#include "clock-publication-tests.inc"
+
+#include "rom-window-loop-tests.inc"

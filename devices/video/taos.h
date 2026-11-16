@@ -182,6 +182,7 @@ private:
     void enable_display();
     void disable_display();
     void convert_frame_15bpp_indexed(uint8_t *dst_buf, int dst_pitch);
+    std::unique_ptr<const pippin_indexed::Snapshot> snapshot_indexed_frame() override;
 
     std::unique_ptr<AthensClocks>   clk_gen = nullptr;
     std::unique_ptr<Bt856>          vid_enc = nullptr;

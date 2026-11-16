@@ -1402,8 +1402,9 @@ static void ppc_exec_inner(uint32_t start_addr, uint32_t size)
     const bool sheep_enabled = sheep_jit_enabled();
     const SheepROMWindow *rom_window = nullptr;
     if constexpr (exec_type == main && endian == big_end && rom_profile && (fixture_path == 0 || fixture_path == 3)) {
-        const char *window_setting = std::getenv("SHEEP_PIPPIN_ROM_WINDOW");
-        if (sheep_enabled && (fixture_path == 3 || (window_setting && !std::strcmp(window_setting,"on"))))
+        // Q226: the environment is fixed after startup; read it once, not on every exception re-entry.
+        static const bool window_env_on = [] { const char *window_setting = std::getenv("SHEEP_PIPPIN_ROM_WINDOW"); return window_setting && !std::strcmp(window_setting,"on"); }();
+        if (sheep_enabled && (fixture_path == 3 || window_env_on))
             rom_window = sheep_mmu_rom_window_get();
     }
     PPCOpcode *compact_decoder = sheep_compact_decoder(opcode_grabber);
@@ -1460,10 +1461,11 @@ static void ppc_exec_inner(uint32_t start_addr, uint32_t size)
     steady.power=reinterpret_cast<uintptr_t>(&power_on);
     steady.itlb=reinterpret_cast<uintptr_t>(&pCurITLB1);steady.mask=reinterpret_cast<uintptr_t>(&tlb_size_mask);
     steady.rom_begin=sheep_rom_host_begin;steady.rom_end=sheep_rom_host_end;steady.window=rom_window;
-    const char *steady_setting=std::getenv("SHEEP_PIPPIN_CPU_LOOP");
-    const bool steady_enabled=fixture_path ? (fixture_path==2 || fixture_path==3) : ((!steady_setting||std::strcmp(steady_setting,"off"))&&sheep_direct_poll_layout());
-    const char *ram_setting=std::getenv("SHEEP_PIPPIN_CPU_RAM");
-    steady.allow_ram=!ram_setting||std::strcmp(ram_setting,"off");
+    static const bool steady_env_on=[]{const char *steady_setting=std::getenv("SHEEP_PIPPIN_CPU_LOOP");return !steady_setting||std::strcmp(steady_setting,"off");}();
+    static const bool direct_poll_ok=sheep_direct_poll_layout();
+    const bool steady_enabled=fixture_path ? (fixture_path==2 || fixture_path==3) : (steady_env_on&&direct_poll_ok);
+    static const bool ram_env_on=[]{const char *ram_setting=std::getenv("SHEEP_PIPPIN_CPU_RAM");return !ram_setting||std::strcmp(ram_setting,"off");}();
+    steady.allow_ram=ram_env_on;
     while (power_on) {
         if (exec_type == debug)
             if (ppc_state.pc >= start_addr && ppc_state.pc < start_addr + size)

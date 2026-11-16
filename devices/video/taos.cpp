@@ -38,7 +38,9 @@ TaosVideo::TaosVideo() : VideoCtrlBase() {
     supports_types(HWCompType::MMIO_DEV);
 
     // initialize the video clock generator
-    this->clk_gen = std::unique_ptr<AthensClocks>(new AthensClocks(0x29, 20000000.0f));
+    // Q233: crystal chosen so the Pippin driver's NTSC programming (N2/(D2*post) = 23/32) gives the
+    // standard 12.2727 MHz square-pixel NTSC dot clock (previously a guessed 20 MHz -> 14.375 MHz).
+    this->clk_gen = std::unique_ptr<AthensClocks>(new AthensClocks(0x29, 17075099.0f));
 
     // register the video clock generator with the I2C host
     I2CBus* i2c_bus = dynamic_cast<I2CBus*>(gMachineObj->get_comp_by_type(
@@ -201,6 +203,19 @@ void TaosVideo::enable_display() {
     this->stop_refresh_task();
 
     this->refresh_rate = (double)(this->pixel_clock) / (this->hori_total * this->vert_total);
+
+    // Q233: Taos vertical timing registers count half-lines per field (NTSC VHLINE = 525 = 262.5
+    // lines) and HLFLN is half a line. VBL occurs once per field.
+    {
+        const int half_line        = int(swatch_regs[REG_TO_INDEX(HLFLN)] >> 20);
+        const int field_half_lines = int(swatch_regs[REG_TO_INDEX(VHLINE)] >> 20);
+        if (half_line > 0 && field_half_lines > 0 && this->pixel_clock > 0) {
+            this->hori_total   = 2 * half_line;
+            this->vert_total   = field_half_lines / 2;
+            this->vert_blank   = this->vert_blank / 2 > 0 ? this->vert_blank / 2 : 1;
+            this->refresh_rate = double(this->pixel_clock) / (double(this->hori_total) * field_half_lines / 2.0);
+        }
+    }
 
     LOG_F(INFO, "%s: refresh rate set to %f Hz", this->name.c_str(), this->refresh_rate);
 

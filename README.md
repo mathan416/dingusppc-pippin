@@ -38,7 +38,7 @@ few Pippin accuracy fixes.
   needs to instead of flushing the whole TLB.
 - Faster MMU lookups for the common cases.
 - The guest CPU runs on its own thread, separate from video and audio.
-- Pi 4 build flags: `-mcpu=cortex-a72` and single-partition LTO (`pippin/pi4-build/`).
+- Pi 4 build flags: `-mcpu=cortex-a72` and single-partition LTO (`pippin/build.sh`).
 
 ### Accuracy
 
@@ -112,12 +112,19 @@ and puts the binary in `build/bin/dingusppc`. If you build by hand, keep its two
 - Don't use PGO. It moves globals that the CPU loop expects at fixed offsets. The startup
   self-tests catch this.
 
-`pippin/pi4-build/` has the exact script behind our deployed Pi 4 builds.
-
 ## Running
 
 You need a Pippin ROM (we test with Kinka 1.3, `kinka13.rom`) and the game's data track
-as a raw image.
+as a raw image. Neither is included: you have to supply your own.
+
+The simplest way to start a game is the launcher, which sets everything below:
+
+```
+pippin/run.sh kinka13.rom disc.bin
+PIPPIN_AUTHENTIC=on pippin/run.sh kinka13.rom disc.bin   # real Pippin CPU speed
+```
+
+The full command it runs:
 
 ```
 SHEEP_PIPPIN_JIT=on SHEEP_PIPPIN_FASTMEM=on SHEEP_PIPPIN_ROM_ONLY=1 \

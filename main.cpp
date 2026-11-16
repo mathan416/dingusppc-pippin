@@ -26,6 +26,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
  * Change log:
  *   2026-11-15 - Q219 baseline (Q48 to Q219, before version control): CPU-owner thread, realtime clock, Pippin cabinet options.
  *   2026-11-16 - --jit-selftest option for CI (JIT self-tests without running guest code).
+ *   2026-11-17 - v1.0.0 review: --jit-selftest reports FAIL if the machine cannot be built; note when -m pippin runs without the JIT.
  * Full history: PIPPIN.md and Git history.
  */
 
@@ -565,6 +566,8 @@ int main(int argc, char** argv) {
         LOG_F(ERROR, "Must specify a machine or provide a supported ROM.");
             return 1;
     }
+    if (machine_str == "pippin" && !std::getenv("SHEEP_PIPPIN_JIT"))
+        LOG_F(WARNING, "Pippin is running on the interpreter (slow). Use pippin/run.sh, or see README.md for the JIT settings.");
 
     // Hook to allow properties to be read from the command-line, regardless
     // of when they are registered.
@@ -703,6 +706,11 @@ void run_machine(std::string machine_str, char* rom_data,
     }
 
     if (MachineFactory::create_machine_for_id(machine_str, rom_data, rom_size) < 0) {
+        if (g_jit_selftest) {
+            fprintf(stderr, "PIPPIN JIT SELFTEST FAIL (machine could not be created)\n");
+            fflush(stderr);
+            std::_Exit(1);
+        }
         return;
     }
 

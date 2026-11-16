@@ -28,7 +28,7 @@ two submodules are identical to upstream's pinned commits.
 | Commit | Change | Measured effect (Pi 4, realtime timers) |
 | --- | --- | --- |
 | Q219 baseline | JIT, dispatcher, fastmem, CPU owner and Pippin fixes, squashed. The earlier history (Q48-Q219) was never under version control. | — |
-| Q224a | Build: `-mcpu=cortex-a72`, single-partition LTO (see `pippin/pi4-build/`) | L-Zone +2.5%, Tamagotchi +0.9% |
+| Q224a | Build: `-mcpu=cortex-a72`, single-partition LTO (now `pippin/build.sh`) | L-Zone +2.5%, Tamagotchi +0.9% |
 | Q226 | Read the exec-entry `getenv` lookups once | part of Q227 |
 | Q227 | Precise `tlbie` (congruence class), ROM window kept across same-mode `mmu_change_mode` | L-Zone +7.8%, Tamagotchi +2.2%; fastmem remaps −80% |
 | Q233 | Taos VBL at 59.94 Hz (half-line timing decode, 17.075 MHz Athens crystal) | Refresh 35.2 → 59.94 Hz; about −3% CPU |
@@ -37,6 +37,7 @@ two submodules are identical to upstream's pinned commits.
 | F12 | ROM window kept across exceptions and `rfi` unless a deferred mapping change or endian switch is pending | ROM-window invalidations −50%; Pi 4 +0.5% (noise) |
 | Pi 5 | `pippin/build.sh` tunes for Pi 4 or Pi 5; fastmem switches itself off on 16 KB-page kernels | Pi 500 (4 KB kernel): L-Zone about 137 M instr/s, 3.6× the Pi 4 |
 | CI | `--jit-selftest`, CTest registration of the unit tests, ARM64 GitHub Actions job | — |
+| v1.0.0 review | Frame pool off unless `SHEEP_FRAME_POOL=on`; `pippin/run.sh` launcher with the tested settings; warning when `-m pippin` runs without the JIT; `--jit-selftest` fails cleanly if the machine can't be built; cabinet-only build scripts removed | — |
 
 On the L-Zone intro, the CPU-bound fly-in runs at about 146% of a real
 Pippin. Timer- and audio-paced content runs at true speed under
@@ -44,8 +45,7 @@ Pippin. Timer- and audio-paced content runs at true speed under
 
 ## Building and running
 
-Build with `pippin/build.sh` (see the README); `pippin/pi4-build/` has the exact script
-behind the deployed Pi 4 builds. Typical cabinet invocation:
+Build with `pippin/build.sh` (see the README) and run with `pippin/run.sh ROM DISC`. Typical cabinet invocation:
 
     pippin-v233 -r --realtime --start-date=1997-06-01 -m pippin -b kinka13.rom \
       --cdr_config=ScsiMesh:3 --cdr_img2=disc.bin --rambank3_size=8 \
@@ -55,7 +55,7 @@ Runtime policy environment, as deployed: `SHEEP_PIPPIN_JIT=on
 SHEEP_PIPPIN_FASTMEM=on SHEEP_PIPPIN_ROM_ONLY=1 SHEEP_CPU_OWNER=on
 SHEEP_RAW_FRAME=on SHEEP_FRAME_POOL=off SHEEP_PIPPIN_ROM_WINDOW=on
 SHEEP_PIPPIN_ISLAND_PACK=on mesa_glthread=false`. Raw frames need
-`SHEEP_FRAME_POOL=off`; with the pool on (its default under `SHEEP_CPU_OWNER=on`)
+`SHEEP_FRAME_POOL=off`; with `SHEEP_FRAME_POOL=on` (off by default since v1.0.0)
 frames are converted to RGB on the guest thread instead.
 `SHEEP_PIPPIN_JIT=verify` runs the startup self-tests and the interpreter oracle.
 `--jit-selftest` runs only the self-tests and exits (0 = pass); it needs no real ROM, so CI

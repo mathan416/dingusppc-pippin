@@ -1,4 +1,4 @@
-# DingusPPC-Pippin
+# DingusPPC-Pippin: provenance and history
 
 A fork of [DingusPPC](https://github.com/dingusdev/dingusppc) for running the
 Apple/Bandai Pippin at full speed on a Raspberry Pi 4, with an ARM64 JIT
@@ -9,7 +9,7 @@ from the SheepShaver lineage.
 | Part | Origin | Licence |
 | --- | --- | --- |
 | Emulator core: machine models (incl. Pippin), devices, MMU, interpreter, main loop | DingusPPC, branched from `dingusdev/dingusppc@810c3f9` (2026-10-28) | GPL-3.0-or-later |
-| `cpu/ppc/nw_jit.*`, `cpu/ppc/nw_io.*`: New World ARM64 JIT | SheepShaver lineage, © 2026 Bill Cavalieri; SheepShaver © 1997-2008 Christian Bauer and Marc Hellwig | GPL-2.0-or-later |
+| `cpu/ppc/nw_jit.*`, `cpu/ppc/nw_io.*`: New World ARM64 JIT | SheepShaver lineage: `billcavalieri/macemu` branch `arm64-jit` @ `1e6abc0`, © 2026 Bill Cavalieri; SheepShaver © 1997-2008 Christian Bauer and Marc Hellwig | GPL-2.0-or-later |
 | Bridge, ROM fast dispatcher, fastmem, CPU-owner threading, Pippin fixes | This fork | GPL-3.0-or-later |
 | `thirdparty/capstone`, `thirdparty/cubeb` | Upstream submodules, unchanged and at the same pinned commits | their own licences |
 

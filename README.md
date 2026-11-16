@@ -122,6 +122,16 @@ sudo reboot
 
 After the reboot, `getconf PAGESIZE` should print `4096`.
 
+## Documentation
+
+| Document | What's in it |
+| --- | --- |
+| [docs/configuration.md](docs/configuration.md) | Every option and environment variable, keyboard shortcuts, and the files the emulator writes |
+| [docs/controllers.md](docs/controllers.md) | Gamepads, trackballs and keyboards without extra software; adding a Pippin system to RetroPie |
+| [docs/architecture.md](docs/architecture.md) | The Pippin's hardware, the PowerPC 603, and how the JIT, fastmem and threading work |
+| [docs/testing.md](docs/testing.md) | Self-tests, unit tests, verify mode, speed checks, and what CI and releases run |
+| [PIPPIN.md](PIPPIN.md) | Provenance, licences, the change history with measurements, and known issues |
+
 ## Building
 
 The JIT emits ARM64 code, so build on 64-bit ARM Linux. We build and test on a Raspberry
@@ -166,6 +176,7 @@ The full command it runs:
 SHEEP_PIPPIN_JIT=on SHEEP_PIPPIN_FASTMEM=on SHEEP_PIPPIN_ROM_ONLY=1 \
 SHEEP_CPU_OWNER=on SHEEP_RAW_FRAME=on SHEEP_FRAME_POOL=off \
 SHEEP_PIPPIN_ROM_WINDOW=on SHEEP_PIPPIN_ISLAND_PACK=on mesa_glthread=false \
+DINGUS_AUDIO_GUEST_SYNC=1 \
 ./dingusppc -r --realtime --start-date=1997-06-01 -m pippin -b kinka13.rom \
   --cdr_config=ScsiMesh:3 --cdr_img2=disc.bin --rambank3_size=8 \
   --adb_devices=AppleJack,Keyboard
@@ -196,6 +207,10 @@ real AppleJack. A gamepad maps to the AppleJack like this:
 | D-pad | Directional pad |
 | LB / RB | Left / right trigger (these also act as mouse clicks) |
 | Back / Guide / Start | The three front buttons |
+
+The analog stick isn't used; steer the pointer with a mouse or trackball. See
+[docs/controllers.md](docs/controllers.md) for PlayStation and Nintendo layouts, unusual
+pads, and setting up RetroPie.
 
 ## Raspberry Pi 5
 

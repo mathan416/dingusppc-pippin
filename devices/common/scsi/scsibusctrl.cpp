@@ -43,6 +43,29 @@ void ScsiBusController::seq_defer_state(uint64_t delay_ns) {
     });
 }
 
+void ScsiBusController::cd_hold_datain(uint64_t delay_ns) {
+    this->cd_cancel_hold();
+    this->cd_hold   = true;
+    this->cur_state = SeqState::IDLE;   // FIFO pops during the hold must not pull data
+    TimerManager::get_instance()->add_oneshot_timer(this->cd_hold_timer, delay_ns,
+        [this](uint64_t, uint64_t) {
+            this->cd_hold   = false;
+            this->cur_state = SeqState::XFER_BEGIN;
+            this->sequencer();
+            if (DmaChannel* ch = this->cd_held_dma) {
+                this->cd_held_dma = nullptr;
+                ch->xfer_retry();   // DBDMA pull that arrived during the hold
+            }
+    });
+}
+
+void ScsiBusController::cd_cancel_hold() {
+    if (this->cd_hold_timer.active)
+        TimerManager::get_instance()->cancel_timer(this->cd_hold_timer);
+    this->cd_hold     = false;
+    this->cd_held_dma = nullptr;
+}
+
 void ScsiBusController::sequencer() {
     switch (this->cur_state) {
     case SeqState::IDLE:
@@ -235,6 +258,10 @@ int ScsiBusController::send_data(uint8_t* dst_ptr, int count) {
 }
 
 int ScsiBusController::xfer_from(DmaChannel *ch_obj, uint8_t *buf, int len) {
+    if (this->cd_hold) [[unlikely]] {   // Q234: data not there yet; retried on release
+        this->cd_held_dma = ch_obj;
+        return 0;
+    }
     if (len > this->to_xfer + this->fifo_pos)
         LOG_F(WARNING, "%s: DMA xfer len > command xfer len", this->name.c_str());
 

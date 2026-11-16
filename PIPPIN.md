@@ -32,6 +32,7 @@ two submodules are identical to upstream's pinned commits.
 | Q226 | Read the exec-entry `getenv` lookups once | part of Q227 |
 | Q227 | Precise `tlbie` (congruence class), ROM window kept across same-mode `mmu_change_mode` | L-Zone +7.8%, Tamagotchi +2.2%; fastmem remaps −80% |
 | Q233 | Taos VBL at 59.94 Hz (half-line timing decode, 17.075 MHz Athens crystal) | Refresh 35.2 → 59.94 Hz; about −3% CPU |
+| Q234 | Optional authentic-speed mode (off by default): CPU governor and CD-ROM timing model | Default unchanged (+0.7%, noise); L-Zone intro at 95% of a real Pippin with the preset |
 
 On the L-Zone intro, the CPU-bound fly-in runs at about 146% of a real
 Pippin. Timer- and audio-paced content runs at true speed under
@@ -49,6 +50,21 @@ Runtime policy environment, as deployed: `SHEEP_PIPPIN_JIT=on
 SHEEP_PIPPIN_FASTMEM=on SHEEP_PIPPIN_ROM_ONLY=1 SHEEP_CPU_OWNER=on
 SHEEP_RAW_FRAME=on SHEEP_PIPPIN_ROM_WINDOW=on SHEEP_PIPPIN_ISLAND_PACK=on`.
 `SHEEP_PIPPIN_JIT=verify` runs the startup self-tests and the interpreter oracle.
+
+## Authentic-speed mode (Q234)
+
+Off by default; acts only under `--realtime`. Guest timers, video and audio are untouched.
+
+| Variable | Meaning |
+| --- | --- |
+| `SHEEP_PIPPIN_AUTHENTIC=on` | Calibrated preset: 26 MIPS CPU cap and a 4× CD (600 KiB/s, 180 ms average access, 50 ms minimum, 256 KiB buffer) |
+| `SHEEP_PIPPIN_MAX_MIPS=N\|off` | CPU cap in million guest instructions per second |
+| `SHEEP_PIPPIN_CD_SPEED=Nx\|KiB/s\|off` | CD transfer rate (1× = 150 KiB/s) |
+| `SHEEP_PIPPIN_CD_SEEK_MS`, `SHEEP_PIPPIN_CD_SEEK_MIN_MS`, `SHEEP_PIPPIN_CD_READAHEAD_KB` | CD access-time model and drive buffer |
+
+The cabinet's `pippin-authentic-speed` launcher entry uses `SHEEP_PIPPIN_AUTHENTIC=on
+SHEEP_PIPPIN_CD_SPEED=off` (CPU cap only): with the CD model on, the known L-Zone intro
+stall occurred in 2 of 17 runs.
 
 ## Candidates for upstream DingusPPC
 

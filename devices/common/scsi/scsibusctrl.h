@@ -104,6 +104,13 @@ protected:
     int         bytes_out = 0;
     uint8_t     data_fifo[DATA_FIFO_DEPTH] = {};
 
+    // Q234: CD timing model holds a DataIn step until the drive would deliver the data.
+    void        cd_hold_datain(uint64_t delay_ns);
+    void        cd_cancel_hold();
+    TimerInfo   cd_hold_timer;
+    bool        cd_hold     = false;
+    DmaChannel* cd_held_dma = nullptr;
+
     // Sequencer state
     TimerInfo   seq_timer;
     uint32_t    cur_state  = Scsi_Bus_Controller::SeqState::IDLE;

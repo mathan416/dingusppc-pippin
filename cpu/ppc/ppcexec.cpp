@@ -26,6 +26,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "ppcdisasm.h"
 #include "sheep_jit_bridge.h"
 #include "pippin_fastmem.h"
+#include "pippin_authentic.h"
 
 #include <algorithm>
 #include <chrono>
@@ -446,6 +447,9 @@ static constexpr uint64_t TIMER_POLL_INTERVAL_NS = 500'000;
 static uint64_t process_events()
 {
     exec_timer = false;
+    // Q234: optional CPU governor (off by default: one predictable branch per batch).
+    if (pippin_gov_enabled && g_realtime) [[unlikely]]
+        pippin_gov_tick(g_icycles, (exec_flags & EXEF_SLEEP) != 0);
     uint64_t next_ns = TimerManager::get_instance()->process_timers();
     pippin_fastmem_poll();
     if (g_realtime) {
@@ -460,7 +464,12 @@ static uint64_t process_events()
         // a relative instruction batch, capped so long deadlines still poll.
         // Comparing an absolute wall-time deadline with g_icycles can otherwise
         // make a fast interpreter process timers after every instruction.
-        return g_icycles + (std::min(delay_ns, TIMER_POLL_INTERVAL_NS) >> icnt_factor) + 1;
+        const uint64_t slice_ns = std::min(delay_ns, TIMER_POLL_INTERVAL_NS);
+        // Q234: a governed CPU retires fewer instructions per guest ns; size the batch so the
+        // next timer deadline is reached on time instead of 62.5/max_mips times late.
+        if (pippin_gov_enabled) [[unlikely]]
+            return g_icycles + pippin_gov_insns_for_ns(slice_ns) + 1;
+        return g_icycles + (slice_ns >> icnt_factor) + 1;
     }
     return (
         (
@@ -2117,6 +2126,7 @@ void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool do_include_6
 {
     sheep_mmu_rom_window_enable(false);
     mem_ctrl_instance = mem_ctrl;
+    pippin_authentic_init();   // Q234: parse and log authentic-speed knobs once
 
     int_pin = false;
     std::memset(&ppc_state, 0, sizeof(ppc_state));

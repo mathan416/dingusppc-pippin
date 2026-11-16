@@ -21,6 +21,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 /** @file SCSI CD-ROM emulation. */
 
+#include <core/timermanager.h>
+#include <cpu/ppc/pippin_authentic.h>
 #include <devices/common/scsi/scsicdrom.h>
 #include <loguru.hpp>
 
@@ -51,6 +53,10 @@ ScsiCdrom::ScsiCdrom(std::string name, int my_id) : ScsiPhysDevice(name, my_id)
 
 void ScsiCdrom::process_command() {
     uint32_t lba;
+
+    // Q234: CD timing model sees every CDB (READs start a timed stream).
+    if (pippin_cd_model_on) [[unlikely]]
+        pippin_cd_on_command(this->cmd_buf, TimerManager::get_instance()->current_time_ns());
 
     if (this->verify_cdb() < 0) {
         this->switch_phase(ScsiPhase::STATUS);

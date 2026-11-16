@@ -22,6 +22,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 /** @file MESH (Macintosh Enhanced SCSI Hardware) controller emulation. */
 
 #include <core/timermanager.h>
+#include <cpu/ppc/pippin_authentic.h>
 #include <devices/common/hwcomponent.h>
 #include <devices/common/hwinterrupt.h>
 #include <devices/common/scsi/mesh.h>
@@ -60,6 +61,7 @@ void MeshController::reset(bool is_hard_reset) {
     this->check_parity  = true;
 
     this->cur_state = Scsi_Bus_Controller::SeqState::BUS_FREE;
+    this->cd_cancel_hold();   // Q234
     update_irq();
 
     if (is_hard_reset) {
@@ -199,6 +201,14 @@ void MeshController::perform_command(const uint8_t cmd) {
             LOG_F(WARNING, "%s: not in DATA IN phase", this->name.c_str());
         this->to_xfer = this->xfer_count ? this->xfer_count : 65536;
         this->cur_state = Scsi_Bus_Controller::SeqState::XFER_BEGIN;
+        if (pippin_cd_model_on) [[unlikely]] {   // Q234: drive transfer/seek time in guest time
+            const uint64_t wait_ns = pippin_cd_datain_wait_ns(this->to_xfer,
+                TimerManager::get_instance()->current_time_ns());
+            if (wait_ns) {
+                this->cd_hold_datain(wait_ns);
+                break;
+            }
+        }
         this->sequencer();
         break;
     case SeqCmd::MessageOut:

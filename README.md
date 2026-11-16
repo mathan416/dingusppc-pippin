@@ -1,3 +1,11 @@
+> **This is DingusPPC-Pippin**, a fork of [DingusPPC](https://github.com/dingusdev/dingusppc)
+> tuned to run the Apple/Bandai Pippin on a Raspberry Pi 4. It adds an ARM64 JIT from
+> the SheepShaver lineage, Pippin video-timing fixes, and an optional authentic-speed
+> mode that reproduces the real console's CPU and CD-ROM speed.
+>
+> See **[PIPPIN.md](PIPPIN.md)** for provenance, licensing, build instructions and measured
+> results. The original DingusPPC README follows unchanged.
+
 # DingusPPC
 
 Written by The DingusPPC Development Team

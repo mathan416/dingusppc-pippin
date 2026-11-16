@@ -2190,7 +2190,9 @@ void dppc_interpreter::ppc_tlbie(uint32_t opcode) {
     // map cleanly to the layout of our virtual TLB. The PowerPC specification
     // allows an implementation to be more lax and flush the entire TLB, so we
     // do that instead.
-    tlb_flush_all_pat();
+    // Q227: invalidate the EA's congruence class (EA bits 15-19) in all segments,
+    // a superset of the MPC603's tlbie, instead of every page translation.
+    tlb_flush_pat_ea(ppc_state.gpr[(opcode >> 11) & 0x1F]);
 }
 
 void dppc_interpreter::ppc_tlbia(uint32_t opcode) {

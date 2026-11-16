@@ -36,6 +36,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <vector>
 #include <typeinfo>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 //#define MMU_PROFILING // uncomment this to enable MMU profiling
 //#define TLB_PROFILING // uncomment this to enable SoftTLB profiling
@@ -60,8 +63,18 @@ static_assert(offsetof(SheepROMWindow, guest_start) == 0 &&
               offsetof(SheepROMWindow, cpu_base) == 16, "ROM window offsets");
 
 const SheepROMWindow* sheep_mmu_rom_window_get() noexcept { return &sheep_rom_window; }
+// Q227 churn counters (CPU worker only), reported at exit.
+static uint64_t q227_window_invalidations=0,q227_mode_calls=0,q227_mode_itlb_changes=0,
+    q227_tlbie_calls=0,q227_tlbie_invalidated=0,q227_tlbie_scanned=0,q227_pat_ctx_changes=0,q227_full_flushes=0;
+static bool q227_env_on(const char *name){const char *s=std::getenv(name);return !s||std::strcmp(s,"off");}
+static const bool q227_precise_tlbie=q227_env_on("SHEEP_PIPPIN_PRECISE_TLBIE");
+static const bool q227_mode_window=q227_env_on("SHEEP_PIPPIN_MODE_WINDOW");
+static struct Q227Report{~Q227Report(){fprintf(stderr,"PIPPIN-MMU-CHURN precise_tlbie=%u mode_window=%u window_invalidations=%llu mode_calls=%llu itlb_mode_changes=%llu tlbie=%llu tlbie_invalidated=%llu tlbie_scanned=%llu full_pat_flushes=%llu pat_ctx_changes=%llu\n",
+    unsigned(q227_precise_tlbie),unsigned(q227_mode_window),(unsigned long long)q227_window_invalidations,(unsigned long long)q227_mode_calls,(unsigned long long)q227_mode_itlb_changes,
+    (unsigned long long)q227_tlbie_calls,(unsigned long long)q227_tlbie_invalidated,(unsigned long long)q227_tlbie_scanned,(unsigned long long)q227_full_flushes,(unsigned long long)q227_pat_ctx_changes);}} q227_report;
 void sheep_mmu_rom_window_invalidate() noexcept {
     // CPU worker owns both writers and consumers. No cross-thread snapshot.
+    q227_window_invalidations++;
     sheep_rom_window.valid_start_count = 0;
 }
 static void sheep_rom_map_changed(MemCtrlBase* owner, bool destroying) noexcept {
@@ -726,13 +739,18 @@ uint8_t     CurDTLBMode = {0xFF}; // current DTLB mode
 
 void mmu_change_mode()
 {
-    sheep_mmu_rom_window_invalidate();
+    q227_mode_calls++;
+    // Q227: the ROM window is derived from the current ITLB tables only; keep it
+    // when an exception/rfi/mtmsr leaves the instruction translation mode unchanged.
+    if (!q227_mode_window) sheep_mmu_rom_window_invalidate();
     uint8_t mmu_mode;
 
     // switch ITLB tables first
     mmu_mode = ((!!(ppc_state.msr & MSR::IR)) << 1) | !!(ppc_state.msr & MSR::PR);
 
     if (CurITLBMode != mmu_mode) {
+        q227_mode_itlb_changes++;
+        if (q227_mode_window) sheep_mmu_rom_window_invalidate();
         switch (mmu_mode) {
             case 1: // user mode can't disable translations
                 mmu_mode = 0;
@@ -1149,8 +1167,42 @@ uint8_t *mmu_translate_imem(uint32_t vaddr, uint32_t *paddr)
     return host_va;
 }
 
+// Q227: tlbie invalidates PAT entries of the EA's congruence class (EA bits 15-19,
+// as on the MPC603) in every segment: a superset of the hardware's invalidation.
+static void tlb_invalidate_tracked_pat_class(std::vector<TLBEntry *> &tracked_entries,
+                                             uint32_t page_class)
+{
+    size_t retained_count = 0;
+    q227_tlbie_scanned += tracked_entries.size();
+    for (TLBEntry *tlb_entry : tracked_entries) {
+        uint16_t source = tlb_entry->flags & TLBE_FROM_TRANSLATION;
+        if ((source & TLBE_FROM_PAT) && ((tlb_entry->tag >> 12) & 0x1F) == page_class) {
+            sheep_fast_invalidate(tlb_entry);
+            tlb_entry->tag = TLB_INVALID_TAG;
+            tlb_entry->flags &= ~TLBFlags::TLBE_CTX_TRACKED;
+            q227_tlbie_invalidated++;
+        } else if (source) {
+            tracked_entries[retained_count++] = tlb_entry;
+        } else {
+            tlb_entry->flags &= ~TLBFlags::TLBE_CTX_TRACKED;
+        }
+    }
+    tracked_entries.resize(retained_count);
+}
+
+void tlb_flush_pat_ea(uint32_t ea)
+{
+    q227_tlbie_calls++;
+    if (!q227_precise_tlbie) { tlb_flush_all_pat(); return; }
+    sheep_mmu_rom_window_invalidate();
+    const uint32_t page_class = (ea >> 12) & 0x1F;
+    tlb_invalidate_tracked_pat_class(gTrackedIEntries, page_class);
+    tlb_invalidate_tracked_pat_class(gTrackedDEntries, page_class);
+}
+
 void tlb_flush_all_pat()
 {
+    q227_full_flushes++;
     sheep_mmu_rom_window_invalidate();
 #ifdef MMU_PROFILING
     pat_flushes_total++;
@@ -1248,6 +1300,7 @@ static void ppc_dbat_update(uint32_t bat_reg)
 
 void mmu_pat_ctx_changed()
 {
+    q227_pat_ctx_changes++;
     // Page address translation context changed so invalidate all PAT entries
     // from both ITLB and DTLB.
     schedule_tlb_invalidation(TLBType::ITLB, TLBFlags::TLBE_FROM_PAT);

@@ -96,6 +96,7 @@ extern MapDmaResult mmu_map_dma_mem(uint32_t addr, uint32_t size,
 extern void mmu_change_mode(void);
 extern void mmu_pat_ctx_changed();
 extern void tlb_flush_all_pat();
+extern void tlb_flush_pat_ea(uint32_t ea); // Q227: congruence-class tlbie
 extern void mmu_dcbz(uint32_t opcode, uint32_t guest_va);
 
 extern uint64_t mem_read_dbg(uint32_t virt_addr, uint32_t size);

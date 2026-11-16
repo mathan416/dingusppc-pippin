@@ -188,7 +188,12 @@ int sheep_rom_window_selftest() {
         ppc_ibat_update(528); require(!sheep_rom_window.valid_start_count,"real IBAT writer revokes immediately");
         do_ctx_sync(); mmu_translate_imem(base); rearm();
         add_ctx_sync_action([]{}); require(!sheep_rom_window.valid_start_count,"queue enqueue revokes"); do_ctx_sync(); rearm();
-        mmu_change_mode(); require(!sheep_rom_window.valid_start_count,"mode selector revokes"); rearm();
+        // Q227: a same-mode selector call keeps the window (ITLB tables unchanged); a real
+        // instruction-translation mode change still revokes it.
+        mmu_change_mode(); require(q227_mode_window ? sheep_rom_window.valid_start_count!=0 : !sheep_rom_window.valid_start_count,"mode selector same-mode policy"); rearm();
+        { const auto saved_msr=ppc_state.msr; ppc_state.msr^=MSR::IR; mmu_change_mode();
+          require(!sheep_rom_window.valid_start_count,"mode selector revokes on ITLB mode change");
+          ppc_state.msr=saved_msr; mmu_change_mode(); rearm(); }
         tlb_flush_all_pat(); require(!sheep_rom_window.valid_start_count,"TLBIA path revokes"); rearm();
         mmu_pat_ctx_changed(); require(!sheep_rom_window.valid_start_count,"PAT schedule revokes"); do_ctx_sync(); rearm();
         set_reg("SPR528",raw^0x20000u);
@@ -217,7 +222,7 @@ int sheep_rom_window_selftest() {
         sheep_mmu_rom_window_enable(false);
         require(!sheep_rom_window.valid_start_count&&!sheep_mmu_rom_window_cold_refresh(base,host),"default-off and disable revoke");
         sheep_mmu_rom_window_test_end();
-        if(passed!=74) throw std::runtime_error("ROM window fixture census changed");
+        if(passed!=75) throw std::runtime_error("ROM window fixture census changed"); // Q227: +1 real-mode-change case
         fprintf(stderr,"ROM WINDOW SELFTEST %u canonical BAT/range/provenance/writer cases passed\n",passed);
         return 1;
     } catch(const std::exception& e) {

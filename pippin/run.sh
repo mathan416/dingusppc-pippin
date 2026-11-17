@@ -8,6 +8,7 @@
 # Change log:
 #   2026-11-17 - v1.0.0: launcher with the settings every release build was verified with.
 #   2026-11-17 - Add DINGUS_AUDIO_GUEST_SYNC=1 (audio paced to the game, as on every tested setup).
+#   2026-11-17 - Pass absolute ROM and disc paths, so relative paths work together with -w.
 # Full history: PIPPIN.md and Git history.
 # Usage: run.sh ROM DISC [extra dingusppc options]
 #   ROM   Pippin boot ROM (tested with Kinka 1.3, kinka13.rom)
@@ -21,6 +22,9 @@ rom=$1; disc=$2; shift 2
 [ -f "$rom" ] || { echo "ROM not found: $rom" >&2; exit 1; }
 [ -f "$disc" ] || { echo "Disc image not found: $disc" >&2; exit 1; }
 [ -w "$disc" ] || { echo "Disc image is read-only: $disc (DingusPPC opens it read/write; run chmod u+w on it)" >&2; exit 1; }
+# -w changes DingusPPC's working directory before it opens these, so pass absolute paths.
+case $rom in /*) ;; *) rom=$(pwd)/$rom ;; esac
+case $disc in /*) ;; *) disc=$(pwd)/$disc ;; esac
 
 here=$(cd "$(dirname "$0")" && pwd)
 bin=${DINGUSPPC:-}

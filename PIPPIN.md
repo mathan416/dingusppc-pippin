@@ -39,6 +39,7 @@ two submodules are identical to upstream's pinned commits.
 | CI | `--jit-selftest`, CTest registration of the unit tests, ARM64 GitHub Actions job | — |
 | v1.0.0 review | Frame pool off unless `SHEEP_FRAME_POOL=on`; `pippin/run.sh` launcher with the tested settings (refuses a read-only disc image with a clear message); warning when `-m pippin` runs without the JIT; `--jit-selftest` fails cleanly if the machine can't be built; cabinet-only build scripts removed | Pi 4: L-Zone 41.2 vs Q240 41.2 M instr/s, verify 0 mismatches over 479M; Pi 500: 138.6 M instr/s, 0 mismatches over 1.75B |
 | v1.0.1 | `pippin/run.sh` sets `DINGUS_AUDIO_GUEST_SYNC=1` (audio paced to the game, as in every tested setup); `docs/` added | Binaries identical to v1.0.0 |
+| v1.0.2 | `pippin/run.sh` passes absolute ROM and disc paths, so relative paths work together with `-w` | Binaries identical to v1.0.0 |
 
 On the L-Zone intro, the CPU-bound fly-in runs at about 146% of a real
 Pippin. Timer- and audio-paced content runs at true speed under

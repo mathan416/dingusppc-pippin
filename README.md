@@ -102,9 +102,9 @@ The steps are the same on both boards; only the file name changes. Set `PI` to `
 
 ```
 PI=pi4    # or pi5
-wget https://github.com/mathan416/dingusppc-pippin/releases/download/v1.0.0/dingusppc-pippin-v1.0.0-$PI.tar.gz
-tar xf dingusppc-pippin-v1.0.0-$PI.tar.gz
-cd dingusppc-pippin-v1.0.0-$PI
+wget https://github.com/mathan416/dingusppc-pippin/releases/download/v1.0.1/dingusppc-pippin-v1.0.1-$PI.tar.gz
+tar xf dingusppc-pippin-v1.0.1-$PI.tar.gz
+cd dingusppc-pippin-v1.0.1-$PI
 ./run.sh /path/to/kinka13.rom /path/to/disc.bin
 ```
 

@@ -52,7 +52,7 @@ few Pippin accuracy fixes.
 ### Authentic-speed mode
 
 Off by default. It limits the CPU to roughly a real 603 and can also slow CD-ROM reads to
-4× speed. Both were tuned against video of a real Pippin. See
+4× speed. See
 [PIPPIN.md](PIPPIN.md#authentic-speed-mode-q234).
 
 ## Results on a Raspberry Pi 4 (stock 1.5 GHz)
@@ -60,8 +60,7 @@ Off by default. It limits the CPU to roughly a real 603 and can also slow CD-ROM
 - The CPU-heavy part of the L-Zone intro runs at about 146% of a real Pippin.
 - Every game we tested runs faster than real hardware; Power Rangers is the closest, at
   about 23% faster.
-- Anything paced by timers or audio runs at the correct speed, checked against a
-  recording of a real console.
+- Anything paced by timers or audio runs at the correct speed.
 
 ## SheepShaver lineage
 

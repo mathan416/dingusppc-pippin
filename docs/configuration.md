@@ -127,7 +127,7 @@ unaffected; only how fast the guest CPU (and optionally the CD-ROM) works change
 
 | Variable | Values | What it does |
 | --- | --- | --- |
-| `SHEEP_PIPPIN_AUTHENTIC` | `off`, `on` | `on` applies the calibrated preset: CPU capped at 26 million instructions per second, and a 4× CD-ROM (600 KiB/s, 180 ms average access, 50 ms minimum, 256 KiB buffer). Tuned against video of a real Pippin. |
+| `SHEEP_PIPPIN_AUTHENTIC` | `off`, `on` | `on` applies the calibrated preset: CPU capped at 26 million instructions per second, and a 4× CD-ROM (600 KiB/s, 180 ms average access, 50 ms minimum, 256 KiB buffer). |
 | `SHEEP_PIPPIN_MAX_MIPS` | `off`, `0`, `1`–`2000` | CPU cap in million guest instructions per second. Overrides the preset. |
 | `SHEEP_PIPPIN_CD_SPEED` | `off`, `0`, `1x`–`64x`, `16`–`99999` | CD transfer rate, as a multiple of 1× (150 KiB/s) or in KiB/s. `off` keeps the CD at full emulator speed. |
 | `SHEEP_PIPPIN_CD_SEEK_MS` | `0`–`2000` | Average seek time (default 180). |

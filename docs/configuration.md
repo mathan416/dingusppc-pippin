@@ -34,6 +34,7 @@ run.sh ROM DISC [extra dingusppc options]
 | extra options | Passed straight to `dingusppc`, after the launcher's own. |
 | `PIPPIN_AUTHENTIC=on` | Cap the CPU at a real Pippin's speed (26 MIPS). The CD-ROM timing model stays off. |
 | `PIPPIN_SAVES=FOLDER` | Keep each game's saves in its own subfolder of `FOLDER`, named after the disc. The RetroPie installer uses `~/RetroPie/saves/pippin`. |
+| `PIPPIN_PRELOAD=LIB.so` | Load a 64-bit shared library into the emulator (`LD_PRELOAD`), also inside the runtime. For front ends that hook SDL, for example to route controllers or add a gamepad quit combination. |
 | `PIPPIN_RUNTIME=FOLDER` | On a 64-bit kernel with a 32-bit userland, the runtime to run in (default: `runtime/root` next to `run.sh`). See [installing.md](installing.md). |
 | `DINGUSPPC=/path/to/dingusppc` | Use this binary. Otherwise the launcher looks next to itself, then in `../build/bin/`. |
 

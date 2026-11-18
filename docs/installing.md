@@ -49,7 +49,7 @@ The [Releases](https://github.com/mathan416/dingusppc-pippin/releases) page has 
 tuned for the Pi 4 and one for the Pi 5. Either kind of system can use them.
 
 ```
-V=v1.1.0  # the release you want
+V=v1.1.1  # the release you want
 PI=pi4    # or pi5
 wget https://github.com/mathan416/dingusppc-pippin/releases/download/$V/dingusppc-pippin-$V-$PI.tar.gz
 tar xf dingusppc-pippin-$V-$PI.tar.gz

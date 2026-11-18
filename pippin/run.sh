@@ -11,6 +11,7 @@
 #   2026-11-17 - Pass absolute ROM and disc paths, so relative paths work together with -w.
 #   2026-11-18 - CUE/CHD discs, per-game save folders (PIPPIN_SAVES), and the 64-bit runtime
 #                on systems with a 32-bit userland. Now a bash script.
+#   2026-11-18 - PIPPIN_PRELOAD: load a front-end's SDL shim library into the emulator.
 # Full history: PIPPIN.md and Git history.
 # Usage: run.sh ROM DISC [extra dingusppc options]
 #   ROM   Pippin boot ROM (tested with Kinka 1.3, kinka13.rom)
@@ -18,6 +19,8 @@
 # Set PIPPIN_AUTHENTIC=on to cap the CPU at the real Pippin's speed (26 MIPS).
 # Set PIPPIN_SAVES to a folder to keep each game's flash and NVRAM in its own subfolder
 #   (otherwise they go in the current folder, or the folder given with -w).
+# Set PIPPIN_PRELOAD to a 64-bit shared library to load into the emulator (LD_PRELOAD), for
+#   front ends that hook SDL, for example to route controllers or add a quit combination.
 # On a 64-bit kernel with a 32-bit userland, the emulator runs inside the runtime made by
 #   runtime/make-runtime.sh (runtime/root next to this script, or PIPPIN_RUNTIME); needs sudo.
 # Set DINGUSPPC to the binary's path if it is not next to this script or in build/bin.
@@ -66,9 +69,15 @@ if [ "${PIPPIN_AUTHENTIC:-off}" = on ]; then
 fi
 options=(-r --realtime --start-date=1997-06-01 -m pippin --cdr_config=ScsiMesh:3
   --rambank3_size=8 --adb_devices=AppleJack,Keyboard)
+preload=${PIPPIN_PRELOAD:-}
+if [ -n "$preload" ]; then
+  [ -f "$preload" ] || die "PIPPIN_PRELOAD library not found: $preload"
+  preload=$(cd "$(dirname "$preload")" && pwd)/$(basename "$preload")
+fi
 
 # A fully 64-bit system runs the emulator directly.
 if [ -e /lib/ld-linux-aarch64.so.1 ]; then
+  [ -n "$preload" ] && settings+=("LD_PRELOAD=$preload")
   exec env "${settings[@]}" "$bin" "${options[@]}" -b "$rom" --cdr_img2="$image" \
     ${workdir:+-w "$workdir"} "${extra[@]}"
 fi
@@ -82,6 +91,9 @@ Create it once with:  sudo $here/runtime/make-runtime.sh $runtime"
 enter=("$here/runtime/enter.sh" "$runtime" --user
   --ro "$bin:/tmp/pippin/dingusppc" --ro "$rom:/tmp/pippin/rom" --bind "$image:/tmp/pippin/disc.bin")
 [ -n "$workdir" ] && enter+=(--bind "$workdir:/tmp/pippin/saves")
+if [ -n "$preload" ]; then
+  enter+=(--ro "$preload:/tmp/pippin/preload.so"); settings+=(LD_PRELOAD=/tmp/pippin/preload.so)
+fi
 [ -f "$HOME/.asoundrc" ] && enter+=(--ro "$HOME/.asoundrc:/tmp/pippin/home/.asoundrc")
 uid=$(id -u)
 [ -d "/run/user/$uid" ] && enter+=(--bind "/run/user/$uid:/run/user/$uid")

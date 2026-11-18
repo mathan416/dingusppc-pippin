@@ -41,6 +41,7 @@ two submodules are identical to upstream's pinned commits.
 | v1.0.1 | `pippin/run.sh` sets `DINGUS_AUDIO_GUEST_SYNC=1` (audio paced to the game, as in every tested setup); `docs/` added | Binaries identical to v1.0.0 |
 | v1.0.2 | `pippin/run.sh` passes absolute ROM and disc paths, so relative paths work together with `-w` | Binaries identical to v1.0.0 |
 | v1.1.0 | Standalone build and RetroPie install for fully 64-bit systems and for a 64-bit kernel with a 32-bit userland: `pippin/build.sh` detects a 32-bit userland and builds inside a runtime from `pippin/runtime/` (Ubuntu Base 24.04.5, pinned by SHA-256, run as a chroot), `pippin/package.sh`, `pippin/retropie/install.sh`; `run.sh` reads CUE/BIN and CHD discs and keeps per-game saves (`PIPPIN_SAVES`) | Pi 500 (64-bit): build 2 min 38 s; CUE, CHD and raw discs and both RetroPie entries run. Pi 4 cabinet (32-bit userland): runtime build 13 min from scratch, play runtime 650 MB, CUE, CHD and authentic mode run at the live launcher's speed |
+| v1.1.1 | `run.sh` gains `PIPPIN_PRELOAD`, which loads a front end's SDL shim library into the emulator (also inside the 64-bit runtime) | Emulator unchanged. Our cabinet's Controller Router integration now runs on the installer layout through this hook, at the same speed as before (L-Zone 60 s: within 0.5%) |
 
 On the L-Zone intro, the CPU-bound fly-in runs at about 146% of a real
 Pippin. Timer- and audio-paced content runs at true speed under

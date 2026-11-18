@@ -141,46 +141,16 @@ physical button.
 
 ## Setting it up in RetroPie / EmulationStation
 
-These steps add a Pippin system that launches the release build directly. They assume the
-release is unpacked in `/home/pi/dingusppc-pippin` and the ROM is in RetroPie's BIOS folder.
+Use the RetroPie installer that comes with every release and package:
 
-1. **Files**
+```
+retropie/install.sh
+```
 
-   ```
-   /home/pi/dingusppc-pippin/            run.sh, dingusppc, ...
-   /home/pi/RetroPie/BIOS/kinka13.rom    the Pippin ROM
-   /home/pi/RetroPie/roms/pippin/        disc images (.bin or .iso, unzipped, writable)
-   /home/pi/RetroPie/saves/pippin/       the Pippin's flash and NVRAM (create it)
-   ```
-
-2. **Emulator entry.** Create `/opt/retropie/configs/pippin/emulators.cfg`:
-
-   ```
-   dingusppc-pippin = "/home/pi/dingusppc-pippin/run.sh /home/pi/RetroPie/BIOS/kinka13.rom %ROM% -w /home/pi/RetroPie/saves/pippin"
-   dingusppc-pippin-authentic = "env PIPPIN_AUTHENTIC=on /home/pi/dingusppc-pippin/run.sh /home/pi/RetroPie/BIOS/kinka13.rom %ROM% -w /home/pi/RetroPie/saves/pippin"
-   default = "dingusppc-pippin"
-   ```
-
-   The second line is optional: it adds a real-Pippin-speed choice to the runcommand menu.
-   All games share one save folder, as they shared one flash chip on the real console.
-
-3. **System entry.** If EmulationStation doesn't list a Pippin system yet, add this inside
-   `<systemList>` in `/etc/emulationstation/es_systems.cfg` (or a copy in
-   `/opt/retropie/configs/all/emulationstation/es_systems.cfg`, which survives updates):
-
-   ```
-   <system>
-     <name>pippin</name>
-     <fullname>Bandai Pippin</fullname>
-     <path>/home/pi/RetroPie/roms/pippin</path>
-     <extension>.bin .BIN .iso .ISO</extension>
-     <command>/opt/retropie/supplementary/runcommand/runcommand.sh 0 _SYS_ pippin %ROM%</command>
-     <platform>pippin</platform>
-     <theme>pippin</theme>
-   </system>
-   ```
-
-4. **Restart EmulationStation**, then launch a game from the new Pippin system.
+It adds the Pippin system to EmulationStation and two emulators, full speed (the default)
+and real-Pippin speed, which you can switch between in RetroPie's runcommand menu. It also
+creates the games and saves folders. See [installing.md](installing.md#step-2b-install-it-into-retropie)
+for the details, including RetroPie on a 32-bit system.
 
 The gamepad works as soon as the game starts; EmulationStation's own controller setup
 doesn't affect the emulator. Use a trackball or mouse for the pointer (see above).

@@ -89,9 +89,9 @@ issues.
 ## Downloading a release
 
 Prebuilt binaries are on the [Releases](https://github.com/mathan416/dingusppc-pippin/releases)
-page: one tuned for the Pi 4 and one for the Pi 5. Both need **64-bit Raspberry Pi OS
-Bookworm** or newer, plus these libraries (most are already installed on the desktop
-image):
+page: one tuned for the Pi 4 and one for the Pi 5. They run directly on **64-bit Raspberry
+Pi OS Bookworm** or newer, which needs these libraries (most are already installed on the
+desktop image):
 
 ```
 sudo apt install libsdl2-2.0-0 libasound2 libpulse0 libsamplerate0
@@ -102,15 +102,15 @@ The steps are the same on both boards; only the file name changes. Set `PI` to `
 
 ```
 PI=pi4    # or pi5
-wget https://github.com/mathan416/dingusppc-pippin/releases/download/v1.0.2/dingusppc-pippin-v1.0.2-$PI.tar.gz
-tar xf dingusppc-pippin-v1.0.2-$PI.tar.gz
-cd dingusppc-pippin-v1.0.2-$PI
-./run.sh /path/to/kinka13.rom /path/to/disc.bin
+wget https://github.com/mathan416/dingusppc-pippin/releases/download/v1.1.0/dingusppc-pippin-v1.1.0-$PI.tar.gz
+tar xf dingusppc-pippin-v1.1.0-$PI.tar.gz
+cd dingusppc-pippin-v1.1.0-$PI
+./run.sh /path/to/kinka13.rom "/path/to/Game (Japan).cue"
 ```
 
 Add `PIPPIN_AUTHENTIC=on` in front of `./run.sh` to run at a real Pippin's CPU speed.
-No ROM or game discs are included: you need your own, and the disc image must be
-writable. The Pi 4 build also runs on a Pi 5, a little slower than the Pi 5 build.
+No ROM or game discs are included: you need your own. Discs can be CUE/BIN, CHD (needs
+`chdman` from `mame-tools`) or a raw data-track image. The Pi 4 build also runs on a Pi 5, a little slower than the Pi 5 build.
 
 **Pi 5 only:** before the first run, switch to the 4 KB-page kernel so the fast memory
 path is used (one-time; see [Raspberry Pi 5](#raspberry-pi-5)):
@@ -122,12 +122,22 @@ sudo reboot
 
 After the reboot, `getconf PAGESIZE` should print `4096`.
 
+**RetroPie:** from the unpacked folder, run `retropie/install.sh`. It installs the emulator
+into `/opt/retropie/emulators/dingusppc-pippin` and adds the Pippin system and its menu
+entries.
+
+**32-bit systems**, such as the official RetroPie image on a Pi 4: these work too, as long
+as the kernel is 64-bit. The emulator then runs inside a small 64-bit runtime that
+`run.sh` and the RetroPie installer set up. [docs/installing.md](docs/installing.md)
+covers both kinds of system, building, and installing into RetroPie.
+
 ## Documentation
 
 | Document | What's in it |
 | --- | --- |
+| [docs/installing.md](docs/installing.md) | Building and installing on fully 64-bit and 32-bit-userland systems, on its own or into RetroPie |
 | [docs/configuration.md](docs/configuration.md) | Every option and environment variable, keyboard shortcuts, and the files the emulator writes |
-| [docs/controllers.md](docs/controllers.md) | Gamepads, trackballs and keyboards without extra software; adding a Pippin system to RetroPie |
+| [docs/controllers.md](docs/controllers.md) | Gamepads, trackballs and keyboards without extra software |
 | [docs/architecture.md](docs/architecture.md) | The Pippin's hardware, the PowerPC 603, and how the JIT, fastmem and threading work |
 | [docs/testing.md](docs/testing.md) | Self-tests, unit tests, verify mode, speed checks, and what CI and releases run |
 | [PIPPIN.md](PIPPIN.md) | Provenance, licences, the change history with measurements, and known issues |
@@ -150,6 +160,11 @@ Then build:
 pippin/build.sh
 ```
 
+On a 64-bit kernel with a 32-bit userland, the same script builds inside a 64-bit build
+runtime it sets up itself (see [docs/installing.md](docs/installing.md)).
+`pippin/package.sh` then collects the binary, the launcher, the RetroPie installer and the
+docs into `dist/dingusppc-pippin`, the same layout as a release.
+
 The script picks the right CPU tuning for a Pi 4 (`cortex-a72`) or Pi 5 (`cortex-a76`)
 and puts the binary in `build/bin/dingusppc`. If you build by hand, keep its two rules:
 
@@ -160,16 +175,17 @@ and puts the binary in `build/bin/dingusppc`. If you build by hand, keep its two
 
 ## Running
 
-You need a Pippin ROM (we test with Kinka 1.3, `kinka13.rom`) and the game's data track
-as a raw image. Neither is included: you have to supply your own.
+You need a Pippin ROM (we test with Kinka 1.3, `kinka13.rom`) and the game's disc as a
+CUE/BIN, CHD or raw data-track image. Neither is included: you have to supply your own.
 
 The simplest way to start a game is the launcher, which sets everything below:
 
 ```
-pippin/run.sh kinka13.rom disc.bin
-PIPPIN_AUTHENTIC=on pippin/run.sh kinka13.rom disc.bin   # real Pippin CPU speed
+pippin/run.sh kinka13.rom "Game (Japan).cue"
+PIPPIN_AUTHENTIC=on pippin/run.sh kinka13.rom "Game (Japan).cue"   # real Pippin CPU speed
 ```
 
+For a CUE or CHD it first copies the data track into `~/.cache/dingusppc-pippin/discs/`.
 The full command it runs:
 
 ```
@@ -231,8 +247,8 @@ at about 3.6 times the Pi 4's speed, so every game has plenty of headroom.
   Pi 5's Cortex-A76.
 - **Audio:** the Pi 5 has no headphone jack, so sound goes to HDMI or a USB audio device.
   If you have no sound, check which ALSA device SDL is using.
-- **Display:** under KMS/DRM the Pi 5 numbers its display devices differently from the
-  Pi 4. If SDL picks the wrong one, set `SDL_KMSDRM_DEVICE_INDEX`.
+- **Display:** under KMS/DRM, SDL picks the device that has a display. Don't pin
+  `SDL_KMSDRM_DEVICE_INDEX`: the card numbers can change between boots.
 
 ## About DingusPPC
 

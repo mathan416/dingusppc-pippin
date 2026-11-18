@@ -30,10 +30,15 @@ run.sh ROM DISC [extra dingusppc options]
 | Argument or variable | Meaning |
 | --- | --- |
 | `ROM` | Pippin boot ROM. Tested with Kinka 1.3 (`kinka13.rom`). |
-| `DISC` | The game's data track as a raw image (`.bin`/`.iso`). It must be writable: DingusPPC opens disc images read/write. |
+| `DISC` | The game: a `.cue` sheet (with its `.bin` files), a `.chd`, or a raw `.bin`/`.iso` data track. For CUE and CHD the launcher copies the first data track once into `~/.cache/dingusppc-pippin/discs/` and reuses it until the disc changes; CHD needs `chdman` (`sudo apt install mame-tools`). A raw image is used as it is and must be writable, because DingusPPC opens disc images read/write. |
 | extra options | Passed straight to `dingusppc`, after the launcher's own. |
 | `PIPPIN_AUTHENTIC=on` | Cap the CPU at a real Pippin's speed (26 MIPS). The CD-ROM timing model stays off. |
+| `PIPPIN_SAVES=FOLDER` | Keep each game's saves in its own subfolder of `FOLDER`, named after the disc. The RetroPie installer uses `~/RetroPie/saves/pippin`. |
+| `PIPPIN_RUNTIME=FOLDER` | On a 64-bit kernel with a 32-bit userland, the runtime to run in (default: `runtime/root` next to `run.sh`). See [installing.md](installing.md). |
 | `DINGUSPPC=/path/to/dingusppc` | Use this binary. Otherwise the launcher looks next to itself, then in `../build/bin/`. |
+
+The launcher needs `python3` (to read the disc). On a 32-bit userland it runs the emulator
+inside the 64-bit runtime through `sudo`; on a fully 64-bit system it runs it directly.
 
 It runs:
 
@@ -48,8 +53,8 @@ dingusppc -r --realtime --start-date=1997-06-01 -m pippin -b ROM \
 ```
 
 Saves go to the current directory (see [Files the emulator writes](#files-the-emulator-writes)).
-To keep each game's saves separate, start each game from its own folder, or pass
-`-w FOLDER` as an extra option.
+To keep each game's saves separate, set `PIPPIN_SAVES`, or pass `-w FOLDER` as an extra
+option.
 
 ## Command-line options
 
@@ -165,7 +170,7 @@ DingusPPC uses [SDL 2](https://wiki.libsdl.org/SDL2/FrontPage), so the usual SDL
 | `SDL_GAMECONTROLLERCONFIG` | Add a mapping for a gamepad SDL doesn't recognise. See [controllers.md](controllers.md). |
 | `SDL_AUDIODRIVER` | Choose the sound system (`alsa`, `pulseaudio`, `pipewire`, `dummy`). |
 | `SDL_VIDEODRIVER` | Choose the video system (`kmsdrm` on a console without a desktop, `x11`, `wayland`). |
-| `SDL_KMSDRM_DEVICE_INDEX` | On a Pi 5 without a desktop, pick the right display device if SDL chooses the wrong one. |
+| `SDL_KMSDRM_DEVICE_INDEX` | Without a desktop, force a particular display device. Normally leave it unset: SDL picks the device that has a display, and on a Pi the card numbers can change between boots, so a fixed index can break after a reboot. |
 
 ### Variables you may see on the cabinet
 

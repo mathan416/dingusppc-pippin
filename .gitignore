@@ -48,3 +48,7 @@ build-*
 DerivedData
 *.xcodeproj/project.xcworkspace
 *.xcodeproj/xcuserdata
+
+# Pippin build runtime and packages (pippin/build.sh on a 32-bit userland, pippin/package.sh)
+/build-runtime/
+/dist/
